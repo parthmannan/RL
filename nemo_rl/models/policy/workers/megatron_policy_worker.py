@@ -143,6 +143,75 @@ except ImportError:
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
+def log_worker_initialization_info(worker_name: str = "Worker") -> None:
+    """Log worker initialization information including process ID and logical ranks.
+    
+    This function logs the process ID and available logical ranks (tensor parallel, 
+    pipeline parallel, context parallel) to help map nsys profile files back to 
+    specific workers and their roles in distributed training.
+    
+    Args:
+        worker_name: Name/type of the worker being initialized
+    """
+    pid = os.getpid()
+    
+    # Get basic distributed info if available
+    try:
+        import torch
+        if torch.distributed.is_initialized():
+            global_rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+            
+            # Try to get Megatron parallel ranks if available
+            try:
+                from megatron.core.parallel_state import (
+                    get_tensor_model_parallel_rank,
+                    get_pipeline_model_parallel_rank,
+                    get_context_parallel_rank,
+                    get_tensor_model_parallel_world_size,
+                    get_pipeline_model_parallel_world_size,
+                    get_context_parallel_world_size,
+                )
+                
+                tp_rank = get_tensor_model_parallel_rank()
+                pp_rank = get_pipeline_model_parallel_rank()
+                cp_rank = get_context_parallel_rank()
+                tp_size = get_tensor_model_parallel_world_size()
+                pp_size = get_pipeline_model_parallel_world_size()
+                cp_size = get_context_parallel_world_size()
+                
+                log_message = (
+                    f"🚀 {worker_name} initialized: PID={pid}, GlobalRank={global_rank}/{world_size}, "
+                    f"TP={tp_rank}/{tp_size}, PP={pp_rank}/{pp_size}, CP={cp_rank}/{cp_size}"
+                )
+            except ImportError:
+                # Megatron not available, just log basic info
+                log_message = f"🚀 {worker_name} initialized: PID={pid}, GlobalRank={global_rank}/{world_size}"
+        else:
+            # Distributed not initialized
+            log_message = f"🚀 {worker_name} initialized: PID={pid} (distributed not initialized)"
+            
+    except ImportError:
+        # PyTorch not available
+        log_message = f"🚀 {worker_name} initialized: PID={pid} (torch not available)"
+    
+    # Write to both stdout and a dedicated log file to bypass Ray deduplication
+    print(log_message)
+    
+    # Also write to a dedicated worker mapping file
+    try:
+        log_dir = os.environ.get('WORKER_LOG_DIR', '/tmp')
+        
+        # Include SLURM job ID in filename if available
+        job_id = os.environ.get('SLURM_JOB_ID', 'unknown')
+        worker_log_file = os.path.join(log_dir, f'{job_id}_worker_pid_mapping.log')
+        
+        with open(worker_log_file, 'a') as f:
+            f.write(f"{time.time():.6f}: {log_message}\n")
+            f.flush()
+    except Exception:
+        # If file writing fails, don't crash the worker
+        pass
 
 class MegatronGenerationConfig(TypedDict):
     # Total GPU memory (in GB) allocated for KV cache buffers
@@ -864,6 +933,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         ) = setup_megatron_model(
             policy_cfg=self.cfg, cfg=self.megatron_cfg, load_optimizer=init_optimizer
         )
+
+        log_worker_initialization_info("MegatronPolicyWorker")
 
         # Set the param sync function for the model
         if (
