@@ -616,6 +616,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         # with different order of node_bundles
         configure_dynamo_cache()
 
+        # Enable HCP process groups if HCP is configured
+        if self.cfg.get("hybrid_cp", {}).get("enabled", False):
+            if "megatron_cfg" not in self.cfg:
+                self.cfg["megatron_cfg"] = {}
+            self.cfg["megatron_cfg"]["hybrid_context_parallel"] = True
+            logger.info(
+                "HCP enabled: hybrid_context_parallel=True will be passed to Megatron initialization"
+            )
+
         # cfg["model_name"] is allowed to be either an HF model name or a path to an HF checkpoint
         # check if hf_model_name is a path
         hf_model_name = self.cfg["model_name"]
@@ -1174,7 +1183,35 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 pad_factor = 1
                 pad_full_seq_to = None
                 pad_packed_seq_to_multiple_of = 1
-                if self.cfg["dynamic_batching"]["enabled"]:
+
+                # Check if Hybrid Context Parallelism is enabled
+                hcp_enabled = self.cfg.get("hybrid_cp", {}).get("enabled", False)
+
+                if hcp_enabled and self.cfg["sequence_packing"]["enabled"]:
+                    # Use HCP data iterator wrapper
+                    from nemo_rl.models.policy.hcp_data_iterator import create_hcp_data_iterator
+
+                    data_iterator = create_hcp_data_iterator(batch)
+                    data_iterator_len = 1  # HCP processes all samples in one pass
+
+                    # Get sequence dimension for model config
+                    _, seq_dim_size = batch.get_microbatch_iterator_for_packable_sequences_len()
+
+                    mbs = 1
+                    pack_seqs = True
+                    seqlen_key = "input_lengths"
+                    (
+                        pad_factor,
+                        pad_packed_seq_to_multiple_of,
+                        pad_full_seq_to,
+                    ) = _get_pack_sequence_parameters_for_megatron(
+                        self.cfg["megatron_cfg"],
+                        seq_dim_size,
+                    )
+                    seq_dim_size = pad_full_seq_to or seq_dim_size
+
+                    logger.info("Using HCP data iterator for Hybrid Context Parallelism")
+                elif self.cfg["dynamic_batching"]["enabled"]:
                     data_iterator = batch.make_microbatch_iterator_with_dynamic_shapes()
                     data_iterator_len = (
                         batch.get_microbatch_iterator_dynamic_shapes_len()
