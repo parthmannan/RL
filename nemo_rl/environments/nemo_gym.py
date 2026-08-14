@@ -1329,6 +1329,11 @@ def spinup_nemo_gym_actor(
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    port_range = {
+        key: value
+        for key in ("port_range_low", "port_range_high")
+        if (value := nemo_gym_dict.pop(key, None)) is not None
+    }
     # Same treatment for the multimodal knobs: NemoGymConfig declares them as
     # top-level fields, so populate them here instead of leaving the actor to
     # read them back out of Gym's global config dict.
@@ -1363,6 +1368,7 @@ def spinup_nemo_gym_actor(
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
         initial_global_config_dict=nemo_gym_dict,
+        **port_range,
         **multimodal_flags,
     )
 
