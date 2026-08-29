@@ -16,8 +16,18 @@ from __future__ import annotations
 
 import torch
 
-from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
-from nemo_rl.experience.payload import pack_payload, record_to_train_batch
+from nemo_rl.experience.interfaces import (
+    ROLLOUT_ENVIRONMENT_TAG,
+    ROLLOUT_GENERATION_LENGTH_TAG,
+    ROLLOUT_TRUNCATED_TAG,
+    Completion,
+    PromptGroupRecord,
+)
+from nemo_rl.experience.payload import (
+    pack_payload,
+    record_to_rollout_tags,
+    record_to_train_batch,
+)
 
 
 def _routes(start: int, count: int) -> torch.Tensor:
@@ -86,6 +96,45 @@ def _record(completions: list[Completion]) -> PromptGroupRecord:
         completions=completions,
         rollout_metrics={},
     )
+
+
+def test_record_to_rollout_tags_uses_agent_and_assistant_tokens() -> None:
+    record = _record(
+        [
+            _completion(route_start=10, reward=1.0),
+            _completion(route_start=30, reward=2.0),
+        ]
+    )
+    record.extra_env_info = {"agent_ref": {"name": "citation_agent"}}
+    record.completions[0].message_log.append(
+        {
+            "role": "assistant",
+            "content": "second answer",
+            "token_ids": torch.tensor([40, 41, 42]),
+        }
+    )
+    record.completions[1].truncated = True
+
+    assert record_to_rollout_tags(record) == [
+        {
+            ROLLOUT_ENVIRONMENT_TAG: "citation_agent",
+            ROLLOUT_GENERATION_LENGTH_TAG: 5,
+            ROLLOUT_TRUNCATED_TAG: False,
+        },
+        {
+            ROLLOUT_ENVIRONMENT_TAG: "citation_agent",
+            ROLLOUT_GENERATION_LENGTH_TAG: 2,
+            ROLLOUT_TRUNCATED_TAG: True,
+        },
+    ]
+
+
+def test_record_to_rollout_tags_falls_back_to_native_task_name() -> None:
+    record = _record([_completion(route_start=10, reward=1.0)])
+    record.extra_env_info = {"agent_ref": {"name": "   "}}
+    record.metadata["task_name"] = " native-task "
+
+    assert record_to_rollout_tags(record)[0][ROLLOUT_ENVIRONMENT_TAG] == "native-task"
 
 
 def test_record_to_train_batch_preserves_routed_experts_in_tq_payload() -> None:

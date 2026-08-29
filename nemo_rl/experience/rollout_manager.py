@@ -1264,6 +1264,7 @@ class RolloutManager:
         *,
         target_step: Optional[int] = None,
         inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]] = None,
+        rollout_journal_id: Optional[str] = None,
     ) -> RolloutOutcome:
         """Roll out one prompt and commit it, re-dispatching on infrastructure failure.
 
@@ -1284,6 +1285,8 @@ class RolloutManager:
             target_step: Training step this rollout targets; stamped on the buffer slot for StalenessSampler.force_in_order.
             inflight_registry: Optional controller-owned mapping from group ID to
                 its dispatch task and start weight version.
+            rollout_journal_id: Stable controller identity for this prompt
+                obligation across fresh per-attempt group IDs.
 
         Returns:
             ``COMMITTED`` when the group reached the buffer, or ``SKIPPED`` when the
@@ -1315,7 +1318,10 @@ class RolloutManager:
             # Reserved inside the loop so each attempt owns a fresh group_id: rows a
             # failed attempt may have written cannot then collide with the retry's.
             group_id = self._tq_buffer.reserve(
-                weight_version=start_version, target_step=target_step
+                weight_version=start_version,
+                target_step=target_step,
+                prompt=input_sample,
+                journal_id=rollout_journal_id,
             )
             try:
                 # Registered per ATTEMPT, not per prompt: each retry reserves a fresh

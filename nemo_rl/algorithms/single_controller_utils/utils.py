@@ -16,6 +16,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import math
+import re
+from collections import defaultdict
 from typing import Any
 
 import numpy as np
@@ -23,6 +27,11 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.experience.interfaces import (
+    ROLLOUT_ENVIRONMENT_TAG,
+    ROLLOUT_GENERATION_LENGTH_TAG,
+    ROLLOUT_TRUNCATED_TAG,
+)
 
 # Reduction rules for all_mb_metrics. Mirror grpo.py / grpo_sync.py.
 _MB_METRIC_MIN: frozenset[str] = frozenset(
@@ -41,6 +50,16 @@ _MB_METRIC_MEAN: frozenset[str] = frozenset(
         "mean_prompt_length",
     }
 )
+_METRIC_COMPONENT_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _rollout_environment_metric_component(environment: str) -> str:
+    """Return a readable metric component without silent name collisions."""
+    sanitized = _METRIC_COMPONENT_PATTERN.sub("_", environment).strip("_.")
+    if sanitized == environment:
+        return sanitized
+    digest = hashlib.blake2s(environment.encode(), digest_size=8).hexdigest()
+    return f"{sanitized or 'unknown'}-{digest}"
 
 
 def aggregate_step_metrics(train_result: dict[str, Any]) -> dict[str, Any]:
@@ -127,6 +146,88 @@ def reduce_advantage_pump_metrics(
     if seq_logprob_error_metrics:
         out.update(_reduce_seq_logprob_error_metrics(seq_logprob_error_metrics))
     return out
+
+
+def reduce_rollout_length_metrics(
+    rollout_tags: list[dict[str, Any]],
+) -> dict[str, float]:
+    """Aggregate generated-token lengths by rollout environment.
+
+    The tags come from the ``KVBatchMeta`` chunks selected for one optimizer
+    step, so streaming completion order cannot shift a sample into the wrong
+    step's metrics.
+
+    Args:
+        rollout_tags: Per-sample metadata tags accumulated across train chunks.
+
+    Returns:
+        Global mean generation length plus per-environment count, mean, stddev,
+        min, p50, p95, max, and truncation rate when every sample is tagged.
+        Samples from an older checkpoint without diagnostic tags are reported as
+        missing; incomplete cohorts suppress the summaries rather than publish
+        biased statistics for only the tagged subset.
+    """
+    by_environment: dict[str, list[tuple[float, bool]]] = defaultdict(list)
+    missing_samples = 0
+    for tag in rollout_tags:
+        environment = tag.get(ROLLOUT_ENVIRONMENT_TAG)
+        generation_length = tag.get(ROLLOUT_GENERATION_LENGTH_TAG)
+        truncated = tag.get(ROLLOUT_TRUNCATED_TAG)
+        if (
+            not isinstance(environment, str)
+            or not environment
+            or isinstance(generation_length, bool)
+            or not isinstance(generation_length, (int, float))
+            or not isinstance(truncated, bool)
+        ):
+            missing_samples += 1
+            continue
+        generation_length = float(generation_length)
+        if not math.isfinite(generation_length) or generation_length < 0:
+            missing_samples += 1
+            continue
+        by_environment[environment].append((generation_length, truncated))
+
+    tagged_samples = sum(len(rows) for rows in by_environment.values())
+    total_samples = tagged_samples + missing_samples
+    metrics: dict[str, float] = {
+        "rollout_length/tagged_samples": float(tagged_samples),
+        "rollout_length/missing_samples": float(missing_samples),
+        "rollout_length/tag_coverage": (
+            tagged_samples / total_samples if total_samples else 0.0
+        ),
+    }
+    # Older checkpoints predate these tags. Mixing their rows with newly
+    # generated rows and reporting only the tagged subset would make the first
+    # resumed step look complete while excluding exactly the restored samples
+    # under investigation.
+    if missing_samples or not tagged_samples:
+        return metrics
+
+    all_lengths: list[float] = []
+    for environment in sorted(by_environment):
+        rows = by_environment[environment]
+        lengths = np.asarray([length for length, _ in rows], dtype=np.float64)
+        all_lengths.extend(lengths.tolist())
+        metric_environment = _rollout_environment_metric_component(environment)
+        prefix = f"rollout_length/{metric_environment}"
+        metrics.update(
+            {
+                f"{prefix}/count": float(len(rows)),
+                f"{prefix}/mean": float(np.mean(lengths)),
+                f"{prefix}/stddev": float(np.std(lengths)),
+                f"{prefix}/min": float(np.min(lengths)),
+                f"{prefix}/p50": float(np.percentile(lengths, 50)),
+                f"{prefix}/p95": float(np.percentile(lengths, 95)),
+                f"{prefix}/max": float(np.max(lengths)),
+                f"{prefix}/truncation_rate": sum(truncated for _, truncated in rows)
+                / len(rows),
+            }
+        )
+
+    if all_lengths:
+        metrics["mean_gen_tokens_per_sample"] = float(np.mean(all_lengths))
+    return metrics
 
 
 def _reduce_seq_logprob_error_metrics(

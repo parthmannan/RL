@@ -703,6 +703,8 @@ def _train_pump_controller(*, sampler) -> object:
         "rewards": [],
         "masked_advantages": [],
         "sequence_lengths": [],
+        "seq_logprob_error_metrics": [],
+        "rollout_tags": [],
     }
     return ctrl
 
@@ -949,6 +951,52 @@ def test_train_pump_logs_nonzero_stale_group_metrics(monkeypatch) -> None:
     train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
     assert train_metrics["evicted_stale_prompt_groups"] == 2
     assert train_metrics["aborted_stale_inflight_groups"] == 1
+
+
+def test_train_pump_logs_rollout_lengths_for_selected_environment_chunks(
+    monkeypatch,
+) -> None:
+    def meta(sample_prefix: str, environment: str, lengths: list[int]) -> KVBatchMeta:
+        return KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=[f"{sample_prefix}-{i}" for i in range(len(lengths))],
+            fields=[],
+            sequence_lengths=[1] * len(lengths),
+            tags=[
+                {
+                    "weight_version": 0,
+                    "rollout_environment": environment,
+                    "rollout_generation_length": length,
+                    "rollout_truncated": i == len(lengths) - 1,
+                }
+                for i, length in enumerate(lengths)
+            ],
+        )
+
+    ctrl = _train_pump_controller(
+        sampler=_SequenceSampler(
+            [
+                meta("a", "env-a", [10, 30]),
+                meta("b", "env-b", [5, 15]),
+            ]
+        )
+    )
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
+    assert train_metrics["mean_gen_tokens_per_sample"] == pytest.approx(15.0)
+    assert train_metrics["rollout_length/env-a/count"] == 2
+    assert train_metrics["rollout_length/env-a/mean"] == pytest.approx(20.0)
+    assert train_metrics["rollout_length/env-b/count"] == 2
+    assert train_metrics["rollout_length/env-b/mean"] == pytest.approx(10.0)
+    assert train_metrics["rollout_length/tagged_samples"] == 4
+    assert train_metrics["rollout_length/missing_samples"] == 0
+    assert train_metrics["rollout_length/tag_coverage"] == 1
 
 
 def test_train_pump_keeps_train_buffers_once_the_step_is_open(monkeypatch) -> None:

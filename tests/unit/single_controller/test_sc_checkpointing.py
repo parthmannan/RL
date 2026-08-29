@@ -49,7 +49,10 @@ import torch
 import yaml
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-from nemo_rl.algorithms.async_utils.staleness_sampler import WindowedSamplerConfig
+from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    InOrderSamplerConfig,
+    WindowedSamplerConfig,
+)
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     GRPOSaveState,
@@ -256,10 +259,23 @@ class _FakeTQBuffer:
         self.load_return = load_return
         self.state_dict_calls: list[int] = []
         self.load_calls: list[dict[str, Any]] = []
+        self.pending_state: dict[str, Any] = {
+            "partition_id": _PARTITION_ID,
+            "complete": True,
+            "missing_group_ids": [],
+            "rollouts": [],
+            "batch_shortfall": {},
+        }
 
     async def state_dict(self, *, saved_capacity: int) -> dict[str, Any]:
         self.state_dict_calls.append(saved_capacity)
         return dict(self._state)
+
+    def pending_rollouts_state_dict(self) -> dict[str, Any]:
+        return {
+            **self.pending_state,
+            "rollouts": [dict(rollout) for rollout in self.pending_state["rollouts"]],
+        }
 
     async def load_state_dict(
         self,
@@ -318,13 +334,18 @@ def _actor_master_config(
     ft_save_period: Optional[int] = None,
     num_prompts_per_step: int = 2,
     max_num_epochs: int = 1,
+    load_replay_buffer: bool = True,
 ) -> MasterConfig:
     """MasterConfig for in-process SingleControllerActor tests.
 
     All fields are populated (init_tmp_checkpoint dumps the whole config to
     config.yaml); values satisfy validate_single_controller_config.
     """
-    sampler_cfg = WindowedSamplerConfig(max_staleness_versions=1)
+    sampler_cfg = (
+        WindowedSamplerConfig(max_staleness_versions=1)
+        if load_replay_buffer
+        else InOrderSamplerConfig(max_lookahead_versions=1)
+    )
     return MasterConfig.model_construct(
         policy={
             # One optimizer.step per RL step: prompts * generations == gbs.
@@ -359,6 +380,7 @@ def _actor_master_config(
             "save_optimizer": save_optimizer,
             "checkpoint_must_save_by": checkpoint_must_save_by,
             "ft_save_period": ft_save_period,
+            "load_replay_buffer": load_replay_buffer,
         },
         data_plane={"enabled": True, "impl": "transfer_queue"},
         async_rl=AsyncRLConfig(
@@ -459,6 +481,17 @@ def _run_reserve_restore(mc: MasterConfig, actor_args: SingleControllerActorArgs
     async def _main():
         actor = _ACTOR_CLS(mc, actor_args, SetupTimingMetrics())
         await actor._maybe_restore_replacement_reserve()
+        return actor
+
+    return asyncio.run(_main())
+
+
+def _run_replay_restore(mc: MasterConfig, actor_args: SingleControllerActorArgs):
+    """Construct the actor and run only replay-buffer restore selection."""
+
+    async def _main():
+        actor = _ACTOR_CLS(mc, actor_args, SetupTimingMetrics())
+        await actor._maybe_restore_replay_buffer()
         return actor
 
     return asyncio.run(_main())
@@ -1130,6 +1163,153 @@ class TestReplayBufferPersistence:
         # identity lands in training_info.json for the restore-side check.
         assert buffer.state_dict_calls == [4]
         assert _training_info(ckpt_dir, 2)["sampler_name"] == "windowed"
+
+        pending_path = ckpt_dir / "step_2" / "pending_rollouts.pt"
+        assert pending_path.exists()
+        assert torch.load(pending_path, weights_only=False) == buffer.pending_state
+
+    def test_save_uses_pre_yield_dataloader_state_while_admission_is_pending(
+        self, tmp_path
+    ):
+        mc = _actor_master_config(tmp_path, max_num_steps=2, save_period=2)
+        before_pending_batch = {"fake_position": 17}
+
+        _run_train_pump(
+            mc,
+            _make_actor_args(),
+            seed=lambda actor: setattr(
+                actor, "_prefetched_dataloader_state", before_pending_batch
+            ),
+        )
+
+        saved = torch.load(
+            tmp_path / "checkpoints" / "step_2" / "train_dataloader.pt",
+            weights_only=False,
+        )
+        assert saved == before_pending_batch
+
+    def test_save_includes_unlaunched_regeneration_journal_without_duplicates(
+        self, tmp_path
+    ):
+        mc = _actor_master_config(tmp_path, max_num_steps=2, save_period=2)
+        buffer = _FakeTQBuffer()
+        buffered = {
+            "group_id": "g-buffered",
+            "journal_id": "j-buffered",
+            "prompt": {"idx": "buffered"},
+            "target_step": 2,
+        }
+        queued = {
+            "group_id": "g-queued",
+            "journal_id": "j-queued",
+            "prompt": {"idx": "queued"},
+            "target_step": 3,
+        }
+        buffer.pending_state["rollouts"] = [buffered]
+
+        def _seed(actor) -> None:
+            # The active copy is the same obligation as the buffer slot and
+            # must not be serialized twice. The queued entry has not launched
+            # yet and exists nowhere else, so it must remain in the cut.
+            actor._active_rollout_prompts = {"j-buffered": dict(buffered)}
+            actor._pending_rollouts_to_regenerate = [dict(queued)]
+
+        _run_train_pump(
+            mc,
+            _make_actor_args(tq_buffer=buffer),
+            seed=_seed,
+        )
+
+        saved = torch.load(
+            tmp_path / "checkpoints" / "step_2" / "pending_rollouts.pt",
+            weights_only=False,
+        )
+        assert saved["rollouts"] == [buffered, queued]
+
+    def test_false_restore_replays_prompt_journal_without_loading_buffer(
+        self, tmp_path, monkeypatch
+    ):
+        ckpt_dir = tmp_path / "resume_ckpt"
+        ckpt_dir.mkdir()
+        torch.save({"groups": ["biased"]}, ckpt_dir / "replay_buffer.pt")
+        pending_state = {
+            "partition_id": _PARTITION_ID,
+            "complete": True,
+            "missing_group_ids": [],
+            "batch_shortfall": {},
+            "rollouts": [
+                {
+                    "group_id": "g0",
+                    "journal_id": "j0",
+                    "prompt": {"idx": 11},
+                    "target_step": 3,
+                },
+                {
+                    "group_id": "g1",
+                    "journal_id": "j1",
+                    "prompt": {"idx": 12},
+                    "target_step": 3,
+                },
+            ],
+        }
+        torch.save(pending_state, ckpt_dir / "pending_rollouts.pt")
+        mc = _actor_master_config(tmp_path, max_num_steps=3, load_replay_buffer=False)
+        save_state = _initial_grpo_save_state()
+        save_state.current_step = 3
+        save_state.sampler_name = "in_order"
+        buffer = _FakeTQBuffer(load_return=2)
+        printed: list[str] = []
+        monkeypatch.setattr(
+            "builtins.print",
+            lambda *args, **kwargs: printed.append(" ".join(str(a) for a in args)),
+        )
+
+        actor = _run_replay_restore(
+            mc,
+            _make_actor_args(
+                tq_buffer=buffer,
+                last_checkpoint_path=str(ckpt_dir),
+                save_state=save_state,
+            ),
+        )
+
+        assert buffer.load_calls == []
+        assert actor._buffer_capacity._value == 4
+        assert actor._pending_rollouts_to_regenerate == pending_state["rollouts"]
+        assert any("Skipping replay buffer restore" in line for line in printed)
+
+    def test_false_restore_rejects_checkpoint_without_prompt_journal(self, tmp_path):
+        ckpt_dir = tmp_path / "resume_ckpt"
+        ckpt_dir.mkdir()
+        torch.save({"groups": []}, ckpt_dir / "replay_buffer.pt")
+        mc = _actor_master_config(tmp_path, max_num_steps=0, load_replay_buffer=False)
+
+        with pytest.raises(RuntimeError, match="predates pending-prompt journaling"):
+            _run_replay_restore(
+                mc,
+                _make_actor_args(last_checkpoint_path=str(ckpt_dir)),
+            )
+
+    def test_false_restore_rejects_incomplete_prompt_journal(self, tmp_path):
+        ckpt_dir = tmp_path / "resume_ckpt"
+        ckpt_dir.mkdir()
+        torch.save(
+            {
+                "partition_id": _PARTITION_ID,
+                "complete": False,
+                "missing_group_ids": ["legacy-g0"],
+                "batch_shortfall": {},
+                "rollouts": [],
+            },
+            ckpt_dir / "pending_rollouts.pt",
+        )
+        mc = _actor_master_config(tmp_path, max_num_steps=0, load_replay_buffer=False)
+
+        with pytest.raises(RuntimeError, match="legacy-g0"):
+            _run_replay_restore(
+                mc,
+                _make_actor_args(last_checkpoint_path=str(ckpt_dir)),
+            )
 
     def test_run_restores_replay_buffer_and_permits(self, tmp_path):
         ckpt_dir = tmp_path / "resume_ckpt"

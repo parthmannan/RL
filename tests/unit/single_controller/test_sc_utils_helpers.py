@@ -26,10 +26,16 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
     fields_for_put,
     reduce_advantage_pump_metrics,
+    reduce_rollout_length_metrics,
     squeeze_trailing_unit_dim,
     tensor_field,
 )
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.experience.interfaces import (
+    ROLLOUT_ENVIRONMENT_TAG,
+    ROLLOUT_GENERATION_LENGTH_TAG,
+    ROLLOUT_TRUNCATED_TAG,
+)
 
 
 def _meta(size: int, sequence_lengths: list[int] | None = None) -> KVBatchMeta:
@@ -203,6 +209,79 @@ class TestReduceAdvantagePumpMetrics:
         assert out["min_seq_mult_prob_error_after_mask"] == pytest.approx(1.0)
         assert out["num_masked_seqs_by_logprob_error"] == 3
         assert out["masked_correct_pct"] == pytest.approx(1.0 / 3)
+
+
+class TestReduceRolloutLengthMetrics:
+    @staticmethod
+    def _tag(environment: str, length: int, truncated: bool = False) -> dict:
+        return {
+            ROLLOUT_ENVIRONMENT_TAG: environment,
+            ROLLOUT_GENERATION_LENGTH_TAG: length,
+            ROLLOUT_TRUNCATED_TAG: truncated,
+        }
+
+    def test_reduces_each_environment_and_global_mean(self) -> None:
+        out = reduce_rollout_length_metrics(
+            [
+                self._tag("env-a", 10),
+                self._tag("env-b", 5),
+                self._tag("env-a", 30, truncated=True),
+                self._tag("env-b", 15),
+            ]
+        )
+
+        assert out["mean_gen_tokens_per_sample"] == pytest.approx(15.0)
+        assert out["rollout_length/env-a/count"] == 2
+        assert out["rollout_length/env-a/mean"] == pytest.approx(20.0)
+        assert out["rollout_length/env-a/stddev"] == pytest.approx(10.0)
+        assert out["rollout_length/env-a/min"] == 10
+        assert out["rollout_length/env-a/p50"] == pytest.approx(20.0)
+        assert out["rollout_length/env-a/p95"] == pytest.approx(29.0)
+        assert out["rollout_length/env-a/max"] == 30
+        assert out["rollout_length/env-a/truncation_rate"] == pytest.approx(0.5)
+        assert out["rollout_length/env-b/count"] == 2
+        assert out["rollout_length/tagged_samples"] == 4
+        assert out["rollout_length/missing_samples"] == 0
+        assert out["rollout_length/tag_coverage"] == 1
+
+    def test_metric_component_sanitization_does_not_collide(self) -> None:
+        out = reduce_rollout_length_metrics(
+            [self._tag("env/a b", 12), self._tag("env_a_b", 20)]
+        )
+
+        assert out["rollout_length/env_a_b/mean"] == 20
+        encoded_keys = [
+            key
+            for key in out
+            if key.startswith("rollout_length/env_a_b-") and key.endswith("/mean")
+        ]
+        assert len(encoded_keys) == 1
+        assert out[encoded_keys[0]] == 12
+
+    def test_incomplete_legacy_cohort_only_reports_tag_coverage(self) -> None:
+        assert reduce_rollout_length_metrics(
+            [self._tag("env-a", 12), {"weight_version": 0}]
+        ) == {
+            "rollout_length/tagged_samples": 1.0,
+            "rollout_length/missing_samples": 1.0,
+            "rollout_length/tag_coverage": 0.5,
+        }
+
+    def test_invalid_lengths_count_as_missing(self) -> None:
+        assert reduce_rollout_length_metrics(
+            [self._tag("env-a", -1), self._tag("env-a", math.nan)]
+        ) == {
+            "rollout_length/tagged_samples": 0.0,
+            "rollout_length/missing_samples": 2.0,
+            "rollout_length/tag_coverage": 0.0,
+        }
+
+    def test_empty_tags_report_empty_coverage(self) -> None:
+        assert reduce_rollout_length_metrics([]) == {
+            "rollout_length/tagged_samples": 0.0,
+            "rollout_length/missing_samples": 0.0,
+            "rollout_length/tag_coverage": 0.0,
+        }
 
 
 class TestFieldsForPut:

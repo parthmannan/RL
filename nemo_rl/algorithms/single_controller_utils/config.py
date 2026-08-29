@@ -750,6 +750,18 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     )
     validate_gym_actor_concurrency(master_config)
 
+    if (
+        master_config.checkpointing.get("load_replay_buffer", True) is False
+        and async_config.sampler.name != "in_order"
+    ):
+        raise ValueError(
+            "checkpointing.load_replay_buffer=false on the SingleController "
+            "path requires async_rl.sampler.name='in_order'. Exact prompt "
+            "regeneration replays each checkpointed target cohort before the "
+            "dataloader advances; unstamped samplers do not preserve that cohort "
+            "boundary."
+        )
+
     if isinstance(async_config.sampler, ReadyFirstSamplerConfig):
         if not master_config.loss_fn.use_importance_sampling_correction:
             raise ValueError(

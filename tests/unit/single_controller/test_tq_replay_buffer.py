@@ -28,7 +28,13 @@ import nemo_rl.algorithms.async_utils.replay_buffer as _replay_buffer_module
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.interfaces import PromptGroupRecord
+from nemo_rl.experience.interfaces import (
+    ROLLOUT_ENVIRONMENT_TAG,
+    ROLLOUT_GENERATION_LENGTH_TAG,
+    ROLLOUT_TRUNCATED_TAG,
+    Completion,
+    PromptGroupRecord,
+)
 
 # Each record yields _N_GENS training rows.
 _N_GENS = 2
@@ -142,13 +148,26 @@ def _run(coro):
 
 
 def _make_record() -> PromptGroupRecord:
-    """Opaque PromptGroupRecord — converter is stubbed, so contents are unused."""
+    """Two-completion record matching the stub converter's output rows."""
     return PromptGroupRecord(
         prompt_idx=0,
         prompt=[],
-        extra_env_info=None,
-        metadata={},
-        completions=[],
+        extra_env_info={"agent_ref": {"name": "test-agent"}},
+        metadata={"task_name": "nemo_gym"},
+        completions=[
+            Completion(
+                message_log=[{"role": "assistant", "token_ids": torch.tensor([1])}],
+                env_extras=None,
+                truncated=False,
+                reward=0.0,
+            ),
+            Completion(
+                message_log=[{"role": "assistant", "token_ids": torch.tensor([2, 3])}],
+                env_extras=None,
+                truncated=True,
+                reward=0.0,
+            ),
+        ],
         rollout_metrics={},
     )
 
@@ -174,7 +193,12 @@ def _add_group(
 ) -> KVBatchMeta:
     if end_weight is None:
         end_weight = weight
-    group_id = buf.reserve(weight_version=weight, target_step=target_step)
+    prompt = {"idx": f"weight-{weight}-slot-{buf.size()}"}
+    group_id = buf.reserve(  # type: ignore[arg-type]
+        weight_version=weight,
+        target_step=target_step,
+        prompt=prompt,
+    )
     return _run(
         buf.commit(
             group_id,
@@ -256,11 +280,45 @@ class TestTQReplayBufferReserveCommit:
         assert buf.ready_list == [True]
         assert buf.meta_list[0].sample_ids == meta.sample_ids
         # TQ tag uses start_weight_version (dispatch time).
-        assert meta.tags == [{"weight_version": 3}] * _N_GENS
+        assert meta.tags == [
+            {
+                "weight_version": 3,
+                ROLLOUT_ENVIRONMENT_TAG: "test-agent",
+                ROLLOUT_GENERATION_LENGTH_TAG: 1,
+                ROLLOUT_TRUNCATED_TAG: False,
+            },
+            {
+                "weight_version": 3,
+                ROLLOUT_ENVIRONMENT_TAG: "test-agent",
+                ROLLOUT_GENERATION_LENGTH_TAG: 2,
+                ROLLOUT_TRUNCATED_TAG: True,
+            },
+        ]
         assert len(dp.put_calls) == 1
         assert len(trace_calls) == 1
         assert trace_calls[0]["keys"] == meta.sample_ids
         assert trace_calls[0]["data"]["input_lengths"].tolist() == [3, 3]
+
+    def test_commit_rejects_misaligned_diagnostics_before_tq_write(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        group_id = buf.reserve(weight_version=3)
+        record = _make_record()
+        record.completions.pop()
+
+        with pytest.raises(ValueError, match=r"diagnostics=1, rows=2"):
+            _run(
+                buf.commit(
+                    group_id,
+                    record,
+                    start_weight_version=3,
+                    end_weight_version=3,
+                )
+            )
+
+        assert dp.put_calls == []
+        assert dp.depth() == 0
+        assert buf.ready_list == [False]
 
     def test_commit_requires_routed_experts_before_tq_write(self):
         dp = FakeDataPlaneClient()
@@ -599,6 +657,10 @@ class TestTQReplayBufferStateDict:
         assert [g["start_weight"] for g in state["groups"]] == [1, 2]
         assert [g["end_weight"] for g in state["groups"]] == [1, 2]
         assert [g["target_step"] for g in state["groups"]] == [None, None]
+        assert [g["prompt"] for g in state["groups"]] == [
+            {"idx": "weight-1-slot-0"},
+            {"idx": "weight-2-slot-1"},
+        ]
         assert [g["group_id"] for g in state["groups"]] == [
             _group_id_of(metas[0]),
             _group_id_of(metas[1]),
@@ -631,6 +693,10 @@ class TestTQReplayBufferStateDict:
         assert buf2.target_step_list == [None, None]
         assert buf2.ready_list == [True, True]
         assert buf2._group_ids == [_group_id_of(m) for m in metas]
+        assert buf2.prompt_list == [
+            {"idx": "weight-1-slot-0"},
+            {"idx": "weight-2-slot-1"},
+        ]
         assert [m.sample_ids for m in buf2.meta_list] == [
             list(metas[0].sample_ids),
             list(metas[1].sample_ids),
@@ -641,6 +707,48 @@ class TestTQReplayBufferStateDict:
             assert put["sample_ids"] == list(meta.sample_ids)
             assert put["fields"] == {"payload_for": list(meta.sample_ids)}
             assert put["tags"] == [dict(t) for t in meta.tags]
+
+    def test_pending_rollout_journal_includes_ready_and_inflight_prompts(self):
+        buf = _make_buffer(FakeDataPlaneClient())
+        _add_group(buf, weight=1, target_step=6)
+        buf.reserve(  # type: ignore[arg-type]
+            weight_version=1,
+            target_step=7,
+            prompt={"idx": "inflight"},
+        )
+        assert buf.promote_ready_group(to_target_step=5) == 6
+
+        state = buf.pending_rollouts_state_dict()
+
+        assert state == {
+            "partition_id": "rollout_data",
+            "complete": True,
+            "missing_group_ids": [],
+            "rollouts": [
+                {
+                    "group_id": buf._group_ids[0],
+                    "journal_id": buf._group_ids[0],
+                    "prompt": {"idx": "weight-1-slot-0"},
+                    "target_step": 5,
+                },
+                {
+                    "group_id": buf._group_ids[1],
+                    "journal_id": buf._group_ids[1],
+                    "prompt": {"idx": "inflight"},
+                    "target_step": 7,
+                },
+            ],
+        }
+
+    def test_pending_rollout_journal_marks_legacy_prompts_incomplete(self):
+        buf = _make_buffer(FakeDataPlaneClient())
+        group_id = buf.reserve(weight_version=1, target_step=2)
+
+        state = buf.pending_rollouts_state_dict()
+
+        assert state["complete"] is False
+        assert state["missing_group_ids"] == [group_id]
+        assert state["rollouts"] == []
 
     def test_round_trip_preserves_end_weight_and_target_step(self):
         # start != end and a non-None target_step must survive the round-trip:

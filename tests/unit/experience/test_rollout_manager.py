@@ -29,7 +29,7 @@ import json
 import tempfile
 import uuid
 from copy import deepcopy
-from typing import cast
+from typing import Any, cast
 
 import pytest
 import torch
@@ -84,6 +84,8 @@ class _FakeBuffer:
 
     def __init__(self) -> None:
         self.reserve_calls: list[int] = []  # weight_versions passed to reserve
+        self.reserve_prompts: list[Any] = []
+        self.reserve_journal_ids: list[str | None] = []
         self.commit_calls: list[tuple[str, object, int, int]] = []
         self.remove_calls: list[str] = []
         # reserve(weight_version=X) -> group_id; commit fills the slot.
@@ -95,10 +97,14 @@ class _FakeBuffer:
         weight_version: int,
         target_step: int | None = None,
         group_id: str | None = None,
+        prompt: Any = None,
+        journal_id: str | None = None,
     ) -> str:
         if group_id is None:
             group_id = str(uuid.uuid4())
         self.reserve_calls.append(weight_version)
+        self.reserve_prompts.append(prompt)
+        self.reserve_journal_ids.append(journal_id)
         self._slots.append(group_id)
         return group_id
 
@@ -129,9 +135,7 @@ class _FakeImpl:
         self._on_run = on_run
         self.rollout_group_ids: list[str | None] = []
 
-    async def run_rollout(
-        self, input_sample, *, rollout_group_id: str | None = None
-    ):
+    async def run_rollout(self, input_sample, *, rollout_group_id: str | None = None):
         self.rollout_group_ids.append(rollout_group_id)
         if self._on_run is not None:
             await self._on_run(input_sample)
@@ -246,10 +250,14 @@ class TestGenerateAndPushFlow:
         buf.reserve = _logged_reserve  # type: ignore[method-assign]
         buf.commit = _logged_commit  # type: ignore[method-assign]
 
-        _run(mgr.generate_and_push({"prompt": "p"}))
+        _run(
+            mgr.generate_and_push({"prompt": "p"}, rollout_journal_id="stable-journal")
+        )
 
         assert events == ["reserve", "run", "commit"]
         assert buf.reserve_calls == [0]
+        assert buf.reserve_prompts == [{"prompt": "p"}]
+        assert buf.reserve_journal_ids == ["stable-journal"]
         assert len(buf.commit_calls) == 1
         gid, record, start_v, end_v = buf.commit_calls[0]
         assert gid in buf._slots
@@ -275,12 +283,15 @@ class TestGenerateAndPushFlow:
         )
         mgr = _make_manager(buf, impl, retry_policy=policy)
 
-        _run(mgr.generate_and_push({"prompt": "p"}))
+        _run(
+            mgr.generate_and_push({"prompt": "p"}, rollout_journal_id="stable-journal")
+        )
 
         assert len(impl.rollout_group_ids) == 2
         assert impl.rollout_group_ids[0] != impl.rollout_group_ids[1]
         assert buf.remove_calls == [impl.rollout_group_ids[0]]
         assert [call[0] for call in buf.commit_calls] == [impl.rollout_group_ids[1]]
+        assert buf.reserve_journal_ids == ["stable-journal", "stable-journal"]
 
     def test_start_weight_version_pinned_at_reserve_time(self):
         """If set_weight_version is called mid-rollout, start != end."""
@@ -455,9 +466,7 @@ def test_nemo_gym_inputs_use_attempt_identity_without_mutating_source():
         },
     )
     original = deepcopy(input_sample)
-    impl = _nemo_gym_impl(
-        mask_env_flagged_samples=True, num_generations_per_prompt=3
-    )
+    impl = _nemo_gym_impl(mask_env_flagged_samples=True, num_generations_per_prompt=3)
 
     rows = impl._build_inputs(input_sample, rollout_group_id=rollout_group_id)
 

@@ -61,8 +61,16 @@ class _Buffer:
         self.commits: list[str] = []
         self.removals: list[str] = []
 
-    def reserve(self, *, weight_version, target_step=None, group_id=None) -> str:
-        del weight_version, target_step
+    def reserve(
+        self,
+        *,
+        weight_version,
+        target_step=None,
+        group_id=None,
+        prompt=None,
+        journal_id=None,
+    ) -> str:
+        del weight_version, target_step, prompt, journal_id
         group_id = group_id or str(uuid.uuid4())
         self.reserved.append(group_id)
         return group_id
@@ -85,9 +93,7 @@ class _ScriptedImpl:
         self._failures = list(failures)
         self.attempts = 0
 
-    async def run_rollout(
-        self, input_sample, *, rollout_group_id: str | None = None
-    ):
+    async def run_rollout(self, input_sample, *, rollout_group_id: str | None = None):
         del input_sample, rollout_group_id
         index = self.attempts
         self.attempts += 1

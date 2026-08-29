@@ -25,7 +25,58 @@ from nemo_rl.data_plane.codec import pack_jagged_fields
 from nemo_rl.data_plane.column_io import TOKEN_ALIGNED_FIELDS
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.interfaces import PromptGroupRecord
+from nemo_rl.experience.interfaces import (
+    ROLLOUT_ENVIRONMENT_TAG,
+    ROLLOUT_GENERATION_LENGTH_TAG,
+    ROLLOUT_TRUNCATED_TAG,
+    PromptGroupRecord,
+)
+
+
+def record_to_rollout_tags(record: PromptGroupRecord) -> list[dict[str, Any]]:
+    """Build per-completion rollout diagnostics for the metadata sidecar.
+
+    NeMo-Gym identifies an environment through ``agent_ref.name``. Native
+    environments do not carry an agent reference, so their task name is the
+    stable fallback. The generated length matches the existing rollout metric:
+    all assistant-role tokens across every turn of a completion.
+
+    Args:
+        record: Completed prompt group to summarize.
+
+    Returns:
+        One primitive-only tag mapping per completion.
+    """
+    environment: str | None = None
+    if isinstance(record.extra_env_info, dict):
+        agent_ref = record.extra_env_info.get("agent_ref")
+        if isinstance(agent_ref, dict):
+            agent_name = agent_ref.get("name")
+            if isinstance(agent_name, str):
+                agent_name = agent_name.strip()
+                if agent_name:
+                    environment = agent_name
+    if environment is None:
+        task_name = record.metadata.get("task_name")
+        if isinstance(task_name, str):
+            task_name = task_name.strip()
+            if task_name:
+                environment = task_name
+    if environment is None:
+        environment = "unknown"
+
+    return [
+        {
+            ROLLOUT_ENVIRONMENT_TAG: environment,
+            ROLLOUT_GENERATION_LENGTH_TAG: sum(
+                len(message["token_ids"])
+                for message in completion.message_log
+                if message["role"] == "assistant"
+            ),
+            ROLLOUT_TRUNCATED_TAG: bool(completion.truncated),
+        }
+        for completion in record.completions
+    ]
 
 
 def record_to_train_batch(

@@ -24,6 +24,7 @@ import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     ReadyFirstSamplerConfig,
     SamplerConfig,
+    WindowedSamplerConfig,
 )
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
@@ -300,6 +301,18 @@ class TestSetup:
         )
 
         with pytest.raises(ValueError, match=match):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+
+    def test_empty_replay_restore_requires_in_order_sampler(self, patched_factories):
+        mc = _make_master_config(
+            sampler_cfg=WindowedSamplerConfig(max_staleness_versions=1)
+        )
+        mc.checkpointing["load_replay_buffer"] = False
+
+        with pytest.raises(ValueError, match="requires.*in_order"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         patched_factories["setup_response_data"].assert_not_called()

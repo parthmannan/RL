@@ -25,6 +25,7 @@ import ray
 import torch
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
+from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.experience.interfaces import (
@@ -32,7 +33,11 @@ from nemo_rl.experience.interfaces import (
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
     PromptGroupRecord,
 )
-from nemo_rl.experience.payload import pack_payload, record_to_train_batch
+from nemo_rl.experience.payload import (
+    pack_payload,
+    record_to_rollout_tags,
+    record_to_train_batch,
+)
 from nemo_rl.utils.r3_trace import trace_rollout_payload
 
 
@@ -737,6 +742,11 @@ class TQReplayBuffer:
         self.target_step_list: list[Optional[int]] = []
         self.ready_list: list[bool] = []
         self._group_ids: list[str] = []
+        # Original prompts stay parallel with the slots until selection removes
+        # them. A checkpoint can therefore discard generated trajectories and
+        # regenerate the exact untrained prompt set instead of advancing past it.
+        self.prompt_list: list[Optional[DatumSpec]] = []
+        self.journal_id_list: list[Optional[str]] = []
 
     def reserve(
         self,
@@ -744,6 +754,8 @@ class TQReplayBuffer:
         weight_version: int,
         target_step: Optional[int] = None,
         group_id: Optional[str] = None,
+        prompt: Optional[DatumSpec] = None,
+        journal_id: Optional[str] = None,
     ) -> str:
         """Append an unready slot tagged with weight_version.
 
@@ -751,6 +763,11 @@ class TQReplayBuffer:
             weight_version: Weight version stamped on the slot.
             target_step: Training step this slot targets; only consulted by StalenessSampler.force_in_order.
             group_id: Per-group sample_id prefix; defaults to a fresh uuid4.
+            prompt: Original prompt used to generate this group. New
+                SingleController checkpoints retain it so an empty-buffer
+                resume can regenerate the group.
+            journal_id: Stable identity for the controller's prompt obligation
+                across rollout retries. Defaults to the attempt's group ID.
 
         Returns:
             group_id used by the matching commit.
@@ -763,6 +780,8 @@ class TQReplayBuffer:
         self.target_step_list.append(target_step)
         self.ready_list.append(False)
         self._group_ids.append(group_id)
+        self.prompt_list.append(prompt)
+        self.journal_id_list.append(journal_id or group_id)
         return group_id
 
     async def commit(
@@ -799,6 +818,14 @@ class TQReplayBuffer:
         sample_ids, fields, tags = pack_payload(
             train_batch, weight_version=start_weight_version, group_id=group_id
         )
+        rollout_tags = record_to_rollout_tags(record)
+        if len(rollout_tags) != len(tags):
+            raise ValueError(
+                "rollout diagnostics must align with the tensorized prompt group: "
+                f"diagnostics={len(rollout_tags)}, rows={len(tags)}"
+            )
+        for tag, rollout_tag in zip(tags, rollout_tags):
+            tag.update(rollout_tag)
         if self._require_routed_experts and ROUTED_EXPERTS_FIELD not in fields:
             raise RuntimeError(
                 "policy.router_replay.enabled=true requires routed_experts in "
@@ -900,6 +927,8 @@ class TQReplayBuffer:
             del self.target_step_list[i]
             del self.ready_list[i]
             del self._group_ids[i]
+            del self.prompt_list[i]
+            del self.journal_id_list[i]
 
         if remove_in_dp:
             await self._call_dp(
@@ -930,7 +959,17 @@ class TQReplayBuffer:
             "groups": [{"meta", "start_weight", "end_weight", "target_step",
             "group_id", "fields_data"}, ...]}``.
         """
-        snapshot: list[tuple[KVBatchMeta, int, int, Optional[int], str]] = []
+        snapshot: list[
+            tuple[
+                KVBatchMeta,
+                int,
+                int,
+                Optional[int],
+                str,
+                Optional[DatumSpec],
+                Optional[str],
+            ]
+        ] = []
         for i, ready in enumerate(self.ready_list):
             if not ready:
                 continue
@@ -943,11 +982,21 @@ class TQReplayBuffer:
                     self.end_weight_list[i],
                     self.target_step_list[i],
                     self._group_ids[i],
+                    self.prompt_list[i],
+                    self.journal_id_list[i],
                 )
             )
 
         groups: list[dict[str, Any]] = []
-        for meta, start_weight, end_weight, target_step, group_id in snapshot:
+        for (
+            meta,
+            start_weight,
+            end_weight,
+            target_step,
+            group_id,
+            prompt,
+            journal_id,
+        ) in snapshot:
             fields_data = await self._call_dp(
                 "get_samples",
                 sample_ids=meta.sample_ids,
@@ -962,6 +1011,8 @@ class TQReplayBuffer:
                     "target_step": target_step,
                     "group_id": group_id,
                     "fields_data": fields_data,
+                    "prompt": prompt,
+                    "journal_id": journal_id,
                 }
             )
         return {
@@ -1104,12 +1155,55 @@ class TQReplayBuffer:
             self.target_step_list.append(group["target_step"])
             self.ready_list.append(True)
             self._group_ids.append(group["group_id"])
+            # Optional for checkpoints written before prompt journaling.
+            self.prompt_list.append(group.get("prompt"))
+            self.journal_id_list.append(group.get("journal_id", group["group_id"]))
 
         summary = f"📦 Restored {len(groups)} replay group(s) from checkpoint"
         if num_truncated:
             summary += f"; truncated {num_truncated} group(s) over capacity"
         print(summary, flush=True)
         return len(groups)
+
+    def pending_rollouts_state_dict(self) -> dict[str, Any]:
+        """Snapshot exact prompts represented by every live buffer slot.
+
+        Ready slots are generated-but-untrained; unready slots are still in
+        flight. Both must be regenerated when replay trajectory restore is
+        disabled. ``complete`` is false for slots restored from an older
+        checkpoint that did not retain their source prompts, allowing resume
+        to fail safely rather than skip those groups.
+
+        Returns:
+            Primitive envelope plus picklable ``DatumSpec`` prompts in slot
+            order.
+        """
+        rollouts: list[dict[str, Any]] = []
+        missing_group_ids: list[str] = []
+        for group_id, prompt, target_step, journal_id in zip(
+            self._group_ids,
+            self.prompt_list,
+            self.target_step_list,
+            self.journal_id_list,
+            strict=True,
+        ):
+            if prompt is None:
+                missing_group_ids.append(group_id)
+                continue
+            rollouts.append(
+                {
+                    "group_id": group_id,
+                    "journal_id": journal_id or group_id,
+                    "prompt": prompt,
+                    "target_step": target_step,
+                }
+            )
+        return {
+            "partition_id": self._partition_id,
+            "complete": not missing_group_ids,
+            "missing_group_ids": missing_group_ids,
+            "rollouts": rollouts,
+        }
 
     def count_for_target_step(self, target_step: int) -> int:
         """Return how many slots are stamped with ``target_step``."""

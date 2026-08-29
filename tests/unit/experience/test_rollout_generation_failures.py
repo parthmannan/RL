@@ -188,8 +188,16 @@ class _RecordingBuffer:
         self.commits: list[str] = []
         self.removals: list[str] = []
 
-    def reserve(self, *, weight_version, target_step=None, group_id=None) -> str:
-        del weight_version, target_step
+    def reserve(
+        self,
+        *,
+        weight_version,
+        target_step=None,
+        group_id=None,
+        prompt=None,
+        journal_id=None,
+    ) -> str:
+        del weight_version, target_step, prompt, journal_id
         return group_id or str(uuid.uuid4())
 
     async def commit(self, group_id, record, start_weight_version, end_weight_version):

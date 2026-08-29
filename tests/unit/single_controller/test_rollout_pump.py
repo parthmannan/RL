@@ -91,6 +91,17 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
     ctrl._replacement_reserve = deque()
+    ctrl._rollout_checkpoint_lock = asyncio.Lock()
+    ctrl._prefetched_dataloader_state = None
+    ctrl._pending_rollouts_to_regenerate = []
+    ctrl._active_rollout_prompts = {}
+
+
+class _StatefulList(list):
+    """List-backed dataloader exposing the production state_dict surface."""
+
+    def state_dict(self) -> dict[str, int]:
+        return {"remaining_batches": len(self)}
 
 
 class _RecordingBuffer:
@@ -134,8 +145,9 @@ class _RecordingRolloutManager:
         *,
         target_step: int | None = None,
         inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
+        rollout_journal_id: str | None = None,
     ) -> None:
-        del prompt, inflight_registry
+        del prompt, inflight_registry, rollout_journal_id
         self._buffer.reserve(target_step=target_step)
 
 
@@ -171,7 +183,7 @@ def test_rollout_pump_stamps_target_steps(
     prompt_batch = BatchedDataDict(
         {"message_log": [[{"role": "user", "content": "prompt"}]]}
     )
-    ctrl._dataloader = [prompt_batch, prompt_batch]
+    ctrl._dataloader = _StatefulList([prompt_batch, prompt_batch])
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
     ctrl._rollout_exhausted = asyncio.Event()
@@ -211,8 +223,9 @@ def test_rollout_pump_releases_capacity_only_for_uncommitted_prompts(
             *,
             target_step: int | None = None,
             inflight_registry: dict[str, Any] | None = None,
+            rollout_journal_id: str | None = None,
         ) -> RolloutOutcome:
-            del prompt, target_step, inflight_registry
+            del prompt, target_step, inflight_registry, rollout_journal_id
             return outcome
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
@@ -225,9 +238,9 @@ def test_rollout_pump_releases_capacity_only_for_uncommitted_prompts(
     )
     ctrl._rollout_manager = _OutcomeRolloutManager()
     ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
-    ctrl._dataloader = [
-        BatchedDataDict({"message_log": [[{"role": "user", "content": "prompt"}]]})
-    ]
+    ctrl._dataloader = _StatefulList(
+        [BatchedDataDict({"message_log": [[{"role": "user", "content": "prompt"}]]})]
+    )
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
     ctrl._rollout_exhausted = asyncio.Event()
@@ -280,16 +293,18 @@ def test_rollout_pump_tops_up_restored_target_step(
     ctrl._rollout_manager = _RecordingRolloutManager(buffer)
     # lookahead=0 keeps the single batch on target_step 0.
     ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
-    ctrl._dataloader = [
-        BatchedDataDict(
-            {
-                "message_log": [
-                    [{"role": "user", "content": "p0"}],
-                    [{"role": "user", "content": "p1"}],
-                ]
-            }
-        )
-    ]
+    ctrl._dataloader = _StatefulList(
+        [
+            BatchedDataDict(
+                {
+                    "message_log": [
+                        [{"role": "user", "content": "p0"}],
+                        [{"role": "user", "content": "p1"}],
+                    ]
+                }
+            )
+        ]
+    )
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
     ctrl._rollout_exhausted = asyncio.Event()
@@ -322,8 +337,9 @@ class _SkippingRolloutManager:
         *,
         target_step: int | None = None,
         inflight_registry: dict[str, Any] | None = None,
+        rollout_journal_id: str | None = None,
     ) -> RolloutOutcome:
-        del prompt, target_step, inflight_registry
+        del prompt, target_step, inflight_registry, rollout_journal_id
         return RolloutOutcome.SKIPPED
 
 
@@ -359,7 +375,7 @@ def test_rollout_pump_credits_shortfall_only_for_stamped_prompts(
     prompt_batch = BatchedDataDict(
         {"message_log": [[{"role": "user", "content": "prompt"}]]}
     )
-    ctrl._dataloader = [prompt_batch, prompt_batch]
+    ctrl._dataloader = _StatefulList([prompt_batch, prompt_batch])
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
     ctrl._rollout_exhausted = asyncio.Event()
@@ -391,8 +407,9 @@ class _ScriptedRolloutManager:
         *,
         target_step: int | None = None,
         inflight_registry: dict[str, Any] | None = None,
+        rollout_journal_id: str | None = None,
     ) -> RolloutOutcome:
-        del target_step, inflight_registry
+        del target_step, inflight_registry, rollout_journal_id
         self.prompts_seen.append(prompt["message_log"][0]["content"])
         if self._outcomes:
             return self._outcomes.pop(0)
@@ -435,7 +452,7 @@ def _pump_controller(
     )
     ctrl._rollout_manager = manager
     ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=1)
-    ctrl._dataloader = dataloader
+    ctrl._dataloader = _StatefulList(dataloader)
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
     ctrl._rollout_exhausted = asyncio.Event()
@@ -448,6 +465,57 @@ def _pump_controller(
     _init_pump_ledgers(ctrl)
     ctrl._sampler_stamps_target_steps = False
     return ctrl
+
+
+def test_rollout_pump_regenerates_checkpoint_prompts_before_dataloader() -> None:
+    class _Manager:
+        def __init__(self, buffer: _RecordingBuffer) -> None:
+            self._buffer = buffer
+            self.seen: list[str] = []
+
+        async def generate_and_push(
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None = None,
+            inflight_registry: dict[str, Any] | None = None,
+            rollout_journal_id: str | None = None,
+        ) -> RolloutOutcome:
+            del inflight_registry, rollout_journal_id
+            self.seen.append(prompt["message_log"][0]["content"])
+            self._buffer.reserve(target_step=target_step)
+            return RolloutOutcome.COMMITTED
+
+    buffer = _RecordingBuffer()
+    manager = _Manager(buffer)
+    ctrl = _pump_controller(
+        manager,
+        [_batch("next-from-dataloader")],
+        num_prompts_per_step=2,
+        buffer=buffer,
+    )
+    ctrl._buffer_capacity = asyncio.Semaphore(3)
+    ctrl._async_cfg.max_inflight_prompts = 3
+    ctrl._pending_rollouts_to_regenerate = [
+        {
+            "group_id": "old-g0",
+            "journal_id": "old-j0",
+            "prompt": {"message_log": [{"role": "user", "content": "pending-0"}]},
+            "target_step": 0,
+        },
+        {
+            "group_id": "old-g1",
+            "journal_id": "old-j1",
+            "prompt": {"message_log": [{"role": "user", "content": "pending-1"}]},
+            "target_step": 0,
+        },
+    ]
+
+    asyncio.run(ctrl._rollout_pump())
+
+    assert manager.seen == ["pending-0", "pending-1", "next-from-dataloader"]
+    assert buffer.target_step_list == [0, 0, 1]
+    assert ctrl._pending_rollouts_to_regenerate == []
 
 
 class TestReplaceDroppedPrompt:
@@ -821,8 +889,9 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
             *,
             target_step: int | None = None,
             inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
+            rollout_journal_id: str | None = None,
         ) -> None:
-            del target_step, inflight_registry
+            del target_step, inflight_registry, rollout_journal_id
             self._started += 1
             if self._started == 2:
                 self._both_started.set()
@@ -853,16 +922,18 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
         ctrl._rollout_manager = manager
         # Over-sampled windowed policy: admit never gates (buffer unused here).
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
-        ctrl._dataloader = [
-            BatchedDataDict(
-                {
-                    "message_log": [
-                        [{"role": "user", "content": "fail"}],
-                        [{"role": "user", "content": "sibling"}],
-                    ]
-                }
-            )
-        ]
+        ctrl._dataloader = _StatefulList(
+            [
+                BatchedDataDict(
+                    {
+                        "message_log": [
+                            [{"role": "user", "content": "fail"}],
+                            [{"role": "user", "content": "sibling"}],
+                        ]
+                    }
+                )
+            ]
+        )
         ctrl._rollout_permitted = asyncio.Event()
         ctrl._rollout_permitted.set()
         ctrl._rollout_exhausted = asyncio.Event()
@@ -895,8 +966,9 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
             *,
             target_step: int | None = None,
             inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
+            rollout_journal_id: str | None = None,
         ) -> None:
-            del prompt, target_step, inflight_registry
+            del prompt, target_step, inflight_registry, rollout_journal_id
             raise AssertionError("cancelled child unexpectedly started")
 
     class _CancelBeforeStartTaskGroup:
@@ -941,9 +1013,13 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         ctrl._rollout_manager = _NeverCalledRolloutManager()
         # Over-sampled windowed policy: admit never gates (buffer unused here).
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
-        ctrl._dataloader = [
-            BatchedDataDict({"message_log": [[{"role": "user", "content": "prompt"}]]})
-        ]
+        ctrl._dataloader = _StatefulList(
+            [
+                BatchedDataDict(
+                    {"message_log": [[{"role": "user", "content": "prompt"}]]}
+                )
+            ]
+        )
         ctrl._rollout_permitted = asyncio.Event()
         ctrl._rollout_permitted.set()
         ctrl._rollout_exhausted = asyncio.Event()
@@ -1030,7 +1106,7 @@ def test_rollout_pump_writes_expected_tq_data(
     )
     # Wrap each value in a single-element list so size==1 and v[0] returns the original field.
     batched_sample = BatchedDataDict({k: [v] for k, v in input_sample.items()})
-    dataloader = [batched_sample] * num_prompts
+    dataloader = _StatefulList([batched_sample] * num_prompts)
 
     tq_buffer = TQReplayBuffer(
         dp_adapter,

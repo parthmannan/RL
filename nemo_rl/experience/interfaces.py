@@ -25,6 +25,13 @@ NEMO_GYM_TASK_INDEX_KEY = "_ng_task_index"
 NEMO_GYM_ROLLOUT_INDEX_KEY = "_ng_rollout_index"
 NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"
 
+# Primitive per-sample diagnostics carried in KVBatchMeta.tags. Keeping these in
+# the metadata sidecar lets SingleController aggregate the exact cohort selected
+# for training without fetching tensor payloads back from the data plane.
+ROLLOUT_ENVIRONMENT_TAG = "rollout_environment"
+ROLLOUT_GENERATION_LENGTH_TAG = "rollout_generation_length"
+ROLLOUT_TRUNCATED_TAG = "rollout_truncated"
+
 
 @dataclass
 class Completion:

@@ -39,6 +39,7 @@ import logging
 import math
 import os
 import time
+import uuid
 from collections import deque
 from functools import partial
 from typing import Any, Awaitable, Callable, Optional, Union
@@ -64,6 +65,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
     fields_for_put,
     reduce_advantage_pump_metrics,
+    reduce_rollout_length_metrics,
     squeeze_trailing_unit_dim,
     tensor_field,
 )
@@ -86,6 +88,8 @@ Generation = Union[VllmGeneration, SGLangGeneration]
 # Named `log` rather than `logger` to keep it distinct from the experiment
 # Logger this module also uses as `self._logger`.
 log = logging.getLogger(__name__)
+
+_PENDING_ROLLOUTS_FILENAME = "pending_rollouts.pt"
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -210,6 +214,15 @@ class SingleControllerActor:
         # through run() instead of being reported as normal exhaustion.
         self._rollout_exhausted: asyncio.Event = asyncio.Event()
 
+        # Checkpoint snapshots and prompt-batch dispatch share this lock. It
+        # prevents a checkpoint from observing a dataloader batch after it was
+        # consumed but before all of that batch's prompts have reserved buffer
+        # slots and become part of the exact regeneration journal.
+        self._rollout_checkpoint_lock: asyncio.Lock = asyncio.Lock()
+        self._prefetched_dataloader_state: Optional[dict[str, Any]] = None
+        self._pending_rollouts_to_regenerate: list[dict[str, Any]] = []
+        self._active_rollout_prompts: dict[str, dict[str, Any]] = {}
+
         # Count of in-flight generate_and_push calls
         self._inflight_rollouts: int = 0
 
@@ -261,6 +274,7 @@ class SingleControllerActor:
             "masked_advantages": [],
             "sequence_lengths": [],
             "seq_logprob_error_metrics": [],
+            "rollout_tags": [],
         }
 
         print(
@@ -347,11 +361,24 @@ class SingleControllerActor:
     async def _maybe_restore_replay_buffer(self) -> None:
         """Restore replay-buffer groups from the previous run's checkpoint.
 
+        When ``checkpointing.load_replay_buffer`` is false, generated
+        trajectories are discarded and the exact pending prompts recorded by
+        the checkpoint are queued for fresh rollout instead.
+
         Skipped with a warning when the checkpoint was written under a
         different sampler: restored groups carry the saving sampler's
         weight/target-step stamps, which another policy may never select.
         """
         if self._last_checkpoint_path is None:
+            return
+        if self._master_config.checkpointing.get("load_replay_buffer", True) is False:
+            await self._load_pending_rollouts_for_regeneration()
+            print(
+                "📦 Skipping replay buffer restore "
+                "(checkpointing.load_replay_buffer=false); regenerating "
+                f"{len(self._pending_rollouts_to_regenerate)} untrained prompt(s).",
+                flush=True,
+            )
             return
         buffer_path = os.path.join(self._last_checkpoint_path, "replay_buffer.pt")
         if not os.path.exists(buffer_path):
@@ -388,6 +415,125 @@ class SingleControllerActor:
         assert restored <= self._async_cfg.max_buffered_rollouts
         for _ in range(restored):
             await self._buffer_capacity.acquire()
+
+    async def _load_pending_rollouts_for_regeneration(self) -> None:
+        """Load the exact prompt journal required by an empty-buffer resume.
+
+        Checkpoints written before prompt journaling cannot safely opt out of
+        replay restore: their dataloader cursor has advanced past the buffered
+        and in-flight prompts. Refuse that resume rather than silently skip
+        them.
+
+        Raises:
+            RuntimeError: The checkpoint has no complete prompt journal or it
+                was written for another data-plane partition.
+        """
+        assert self._last_checkpoint_path is not None
+        pending_path = os.path.join(
+            self._last_checkpoint_path, _PENDING_ROLLOUTS_FILENAME
+        )
+        if not os.path.exists(pending_path):
+            raise RuntimeError(
+                "checkpointing.load_replay_buffer=false requires "
+                f"{pending_path}, but the checkpoint predates pending-prompt "
+                "journaling. Resume this checkpoint with load_replay_buffer=true "
+                "or start a fresh run."
+            )
+        # weights_only=False: prompts contain pickled DatumSpec leaves. This is
+        # a trusted same-job checkpoint, matching replay_buffer.pt handling.
+        state = await asyncio.to_thread(torch.load, pending_path, weights_only=False)
+        required_keys = {
+            "partition_id",
+            "complete",
+            "missing_group_ids",
+            "rollouts",
+            "batch_shortfall",
+        }
+        if not isinstance(state, dict) or required_keys - set(state):
+            raise RuntimeError(
+                f"Malformed pending-rollout checkpoint at {pending_path}: "
+                f"expected keys {sorted(required_keys)}"
+            )
+        if state["partition_id"] != self._partition_id:
+            raise RuntimeError(
+                "Pending-rollout checkpoint partition mismatch: "
+                f"checkpoint={state['partition_id']!r}, "
+                f"expected={self._partition_id!r}"
+            )
+        if state["complete"] is not True:
+            raise RuntimeError(
+                "checkpointing.load_replay_buffer=false cannot regenerate every "
+                "untrained prompt because the checkpoint is missing source prompts "
+                f"for group(s): {state['missing_group_ids']}"
+            )
+
+        rollouts = state["rollouts"]
+        if not isinstance(rollouts, list):
+            raise RuntimeError(
+                f"Malformed pending-rollout checkpoint at {pending_path}: "
+                "rollouts must be a list"
+            )
+        validated_rollouts: list[dict[str, Any]] = []
+        seen_journal_ids: set[str] = set()
+        for index, rollout in enumerate(rollouts):
+            if not isinstance(rollout, dict) or not {
+                "group_id",
+                "journal_id",
+                "prompt",
+                "target_step",
+            }.issubset(rollout):
+                raise RuntimeError(
+                    f"Malformed pending rollout {index} at {pending_path}"
+                )
+            journal_id = rollout["journal_id"]
+            if (
+                not isinstance(journal_id, str)
+                or not journal_id
+                or journal_id in seen_journal_ids
+            ):
+                raise RuntimeError(
+                    f"Pending rollout {index} has invalid or duplicate "
+                    f"journal_id={journal_id!r}"
+                )
+            seen_journal_ids.add(journal_id)
+            if not isinstance(rollout["prompt"], dict):
+                raise RuntimeError(
+                    f"Pending rollout {index} has malformed prompt="
+                    f"{rollout['prompt']!r}"
+                )
+            target_step = rollout["target_step"]
+            if not isinstance(target_step, int) or isinstance(target_step, bool):
+                raise RuntimeError(
+                    "checkpointing.load_replay_buffer=false on SingleController "
+                    "requires in_order target-step stamps; pending rollout "
+                    f"{index} has target_step={target_step!r}"
+                )
+            if target_step >= self._trainer_version:
+                validated_rollouts.append(rollout)
+
+        batch_shortfall = state["batch_shortfall"]
+        if not isinstance(batch_shortfall, dict) or any(
+            isinstance(step, bool)
+            or not isinstance(step, int)
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 0
+            for step, count in batch_shortfall.items()
+        ):
+            raise RuntimeError(
+                f"Malformed pending-rollout checkpoint at {pending_path}: "
+                "batch_shortfall must map integer target steps to nonnegative counts"
+            )
+        self._batch_shortfall.update(
+            {
+                step: count
+                for step, count in batch_shortfall.items()
+                if step >= self._trainer_version and count
+            }
+        )
+        self._pending_rollouts_to_regenerate = sorted(
+            validated_rollouts, key=lambda rollout: rollout["target_step"]
+        )
 
     async def _maybe_restore_replacement_reserve(self) -> None:
         """Restore spare prompts diverted before the previous run's checkpoint.
@@ -475,6 +621,7 @@ class SingleControllerActor:
             prompt: DatumSpec,
             target_step: Optional[int],
             task_started_event: asyncio.Event,
+            rollout_journal_id: str,
         ) -> None:
             task_started_event.set()
             self._inflight_rollouts += 1
@@ -487,11 +634,18 @@ class SingleControllerActor:
             replacements = 0
             try:
                 while True:
+                    self._active_rollout_prompts[rollout_journal_id] = {
+                        "group_id": None,
+                        "journal_id": rollout_journal_id,
+                        "prompt": prompt,
+                        "target_step": target_step,
+                    }
                     try:
                         outcome = await self._rollout_manager.generate_and_push(
                             prompt,
                             target_step=target_step,
                             inflight_registry=self._inflight_by_group_id,
+                            rollout_journal_id=rollout_journal_id,
                         )
                     except BaseException:
                         # On success ownership transfers to the train pump, which
@@ -525,11 +679,21 @@ class SingleControllerActor:
                     lender_step = self._promote_into_step(target_step)
                     if lender_step is not None:
                         target_step = lender_step
+                    # A checkpoint can land while weight sync keeps this task
+                    # paused. Publish the replacement before that await so the
+                    # journal and the spare-pool snapshot describe the same cut.
+                    self._active_rollout_prompts[rollout_journal_id] = {
+                        "group_id": None,
+                        "journal_id": rollout_journal_id,
+                        "prompt": prompt,
+                        "target_step": target_step,
+                    }
                     # A substitution is a fresh rollout, not a continuation of the one
                     # that failed, so it observes the same pause a first dispatch does
                     # instead of pushing new generation into a weight-sync window.
                     await self._rollout_permitted.wait()
             finally:
+                self._active_rollout_prompts.pop(rollout_journal_id, None)
                 self._inflight_rollouts -= 1
                 sem.release()
 
@@ -554,10 +718,13 @@ class SingleControllerActor:
             _: asyncio.Task[Any],
             *,
             task_started_event: asyncio.Event,
+            rollout_journal_id: str,
         ) -> None:
             if not task_started_event.is_set():
                 self._buffer_capacity.release()
                 sem.release()
+                self._active_rollout_prompts.pop(rollout_journal_id, None)
+                task_started_event.set()
 
         async def _launch(prompt: DatumSpec, target_step: Optional[int]) -> None:
             # check if buffer is full
@@ -568,9 +735,21 @@ class SingleControllerActor:
             await self._rollout_permitted.wait()
 
             task_started_event = asyncio.Event()
+            rollout_journal_id = str(uuid.uuid4())
+            self._active_rollout_prompts[rollout_journal_id] = {
+                "group_id": None,
+                "journal_id": rollout_journal_id,
+                "prompt": prompt,
+                "target_step": target_step,
+            }
             # dispatch rollout
             task = rollout_tasks.create_task(
-                _dispatch_one_prompt(prompt, target_step, task_started_event)
+                _dispatch_one_prompt(
+                    prompt,
+                    target_step,
+                    task_started_event,
+                    rollout_journal_id,
+                )
             )
             self._dispatched_rollouts.add(task)
             task.add_done_callback(self._dispatched_rollouts.discard)
@@ -578,14 +757,88 @@ class SingleControllerActor:
                 partial(
                     _release_permits_if_task_not_started,
                     task_started_event=task_started_event,
+                    rollout_journal_id=rollout_journal_id,
                 )
             )
+            # The controller-owned journal was populated before create_task,
+            # so this prompt is already checkpoint-visible. Do not await the
+            # child here: letting the batch dispatcher continue preserves the
+            # rollout/spare-pool scheduling semantics.
+
+        async def _launch_batch(
+            prompts: list[DatumSpec],
+            target_step: Optional[int],
+            *,
+            accounts_for_prefetched_batch: bool = False,
+            regenerated_journal_ids: Optional[set[str]] = None,
+        ) -> None:
+            async with self._rollout_checkpoint_lock:
+                for prompt in prompts:
+                    await _launch(prompt, target_step)
+                if regenerated_journal_ids:
+                    self._pending_rollouts_to_regenerate = [
+                        rollout
+                        for rollout in self._pending_rollouts_to_regenerate
+                        if rollout["journal_id"] not in regenerated_journal_ids
+                    ]
+                if accounts_for_prefetched_batch:
+                    # Every prompt from this yielded dataloader batch now has
+                    # a live buffer slot carrying its source prompt. The live
+                    # dataloader cursor is safe to checkpoint past the batch.
+                    self._prefetched_dataloader_state = None
+
+        async def _regenerate_checkpoint_prompts() -> None:
+            """Freshly roll out the exact journal discarded on resume."""
+            rollouts_by_target: dict[int, list[dict[str, Any]]] = {}
+            for rollout in self._pending_rollouts_to_regenerate:
+                rollouts_by_target.setdefault(rollout["target_step"], []).append(
+                    rollout
+                )
+            target_steps = sorted(set(rollouts_by_target).union(self._batch_shortfall))
+            for target_step in target_steps:
+                target_rollouts = rollouts_by_target.get(target_step, [])
+                admitted_target = await self._sampler.admit(
+                    trainer_version_fn=lambda: self._trainer_version
+                )
+                if admitted_target != target_step:
+                    raise RuntimeError(
+                        "Pending-rollout journal no longer aligns with the in_order "
+                        f"sampler: checkpoint target={target_step}, "
+                        f"admitted target={admitted_target}"
+                    )
+                await _launch_batch(
+                    [rollout["prompt"] for rollout in target_rollouts],
+                    target_step,
+                    regenerated_journal_ids={
+                        rollout["journal_id"] for rollout in target_rollouts
+                    },
+                )
+                print(
+                    f"  regenerated {len(target_rollouts)} pending prompt(s) for "
+                    f"target_step={target_step} "
+                    f"(shortfall={self._batch_shortfall.get(target_step, 0)})",
+                    flush=True,
+                )
 
         max_epochs = self._master_config.grpo.max_num_epochs
         async with asyncio.TaskGroup() as rollout_tasks:
+            await _regenerate_checkpoint_prompts()
             while max_epochs is None or self._current_epoch < max_epochs:
-                for prompt_batch in self._dataloader:
+                dataloader_iterator = iter(self._dataloader)
+                while True:
+                    # StatefulDataLoader advances when next() yields. Keep the
+                    # state immediately before that yield until every prompt in
+                    # the batch has a journaled slot. If checkpointing lands
+                    # while admission is gated, resuming re-yields this batch.
+                    self._prefetched_dataloader_state = self._dataloader.state_dict()
+                    try:
+                        prompt_batch = next(dataloader_iterator)
+                    except StopIteration:
+                        self._prefetched_dataloader_state = None
+                        break
                     if self._divert_batch_to_reserve(prompt_batch):
+                        # The prompts are now accounted for by reserve_state.
+                        self._prefetched_dataloader_state = None
                         continue
 
                     target_step = await self._sampler.admit(
@@ -606,11 +859,17 @@ class SingleControllerActor:
                                 flush=True,
                             )
 
+                    prompts: list[DatumSpec] = []
                     for prompt_idx in range(num_prompts):
                         prompt: DatumSpec = {  # type: ignore
                             k: v[prompt_idx] for k, v in prompt_batch.items()
                         }
-                        await _launch(prompt, target_step)
+                        prompts.append(prompt)
+                    await _launch_batch(
+                        prompts,
+                        target_step,
+                        accounts_for_prefetched_batch=True,
+                    )
 
                 self._current_epoch += 1
 
@@ -620,7 +879,7 @@ class SingleControllerActor:
         # keep its step whole, whereas an extra step is only worth having if one is
         # left over. A second group because the first is closed to new tasks.
         async with asyncio.TaskGroup() as rollout_tasks:
-            await self._drain_reserve_into_steps(_launch)
+            await self._drain_reserve_into_steps(_launch_batch)
 
         # Drain in-flight so return implies "all rollouts in TQ".
         inflight = list(self._dispatched_rollouts)
@@ -673,7 +932,8 @@ class SingleControllerActor:
         return True
 
     async def _drain_reserve_into_steps(
-        self, launch: Callable[[DatumSpec, Optional[int]], Awaitable[None]]
+        self,
+        launch_batch: Callable[[list[DatumSpec], Optional[int]], Awaitable[None]],
     ) -> None:
         """Train on the leftover spares once the dataloader has nothing more to give.
 
@@ -697,22 +957,20 @@ class SingleControllerActor:
         """
         num_prompts_per_step = self._master_config.grpo.num_prompts_per_step
         while len(self._replacement_reserve) >= num_prompts_per_step:
-            # Take the step's prompts out before the first await. A drop resolving
-            # concurrently draws from this same pool, and could otherwise claim one of
-            # them and leave the step it is filling one group short.
-            step_prompts = [
-                self._replacement_reserve.popleft() for _ in range(num_prompts_per_step)
-            ]
+            # All ordinary rollout tasks settled before this drain starts, so
+            # nothing can draw from the spare pool while admission waits.
             target_step = await self._sampler.admit(
                 trainer_version_fn=lambda: self._trainer_version
             )
+            step_prompts = [
+                self._replacement_reserve.popleft() for _ in range(num_prompts_per_step)
+            ]
             print(
                 f"  dataloader exhausted; training on {len(step_prompts)} pooled "
                 f"spare(s) as target_step={target_step}",
                 flush=True,
             )
-            for prompt in step_prompts:
-                await launch(prompt, target_step)
+            await launch_batch(step_prompts, target_step)
 
         if self._replacement_reserve:
             print(
@@ -936,6 +1194,15 @@ class SingleControllerActor:
                             await asyncio.sleep(0.005)
                             continue
 
+                        if train_meta.tags is None:
+                            self._step_log_dict["rollout_tags"].extend(
+                                {} for _ in train_meta.sample_ids
+                            )
+                        else:
+                            self._step_log_dict["rollout_tags"].extend(
+                                dict(tag) for tag in train_meta.tags
+                            )
+
                         # Release buffer capacity
                         for _ in range(num_groups):
                             self._buffer_capacity.release()
@@ -1071,7 +1338,17 @@ class SingleControllerActor:
 
                 step_metrics = aggregate_step_metrics(result)
                 step_metrics.update(
-                    reduce_advantage_pump_metrics(**self._step_log_dict)
+                    reduce_advantage_pump_metrics(
+                        rewards=self._step_log_dict["rewards"],
+                        masked_advantages=self._step_log_dict["masked_advantages"],
+                        sequence_lengths=self._step_log_dict["sequence_lengths"],
+                        seq_logprob_error_metrics=self._step_log_dict[
+                            "seq_logprob_error_metrics"
+                        ],
+                    )
+                )
+                step_metrics.update(
+                    reduce_rollout_length_metrics(self._step_log_dict["rollout_tags"])
                 )
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
 
@@ -1525,18 +1802,35 @@ class SingleControllerActor:
         # The restore skips the replay buffer when the resuming run uses a
         # different sampler (its stamps may never be selectable there).
         save_state.sampler_name = self._async_cfg.sampler.name
-        # Snapshot before any await so it can't interleave with
-        # _rollout_pump iterating this same dataloader.
-        dataloader_state = self._dataloader.state_dict()
-        # The spare pool has to be saved with that snapshot, not left out of the
-        # checkpoint: diverting a batch already advanced the iterator, so the state
-        # above records those prompts as consumed while they are still only in memory.
-        # Without this a resumed replace-mode run comes back with an empty pool and a
-        # dataloader positioned past the diverted batch, silently losing it -- and
-        # losing it for good, since _drain_reserve_into_steps only ever recovers spares
-        # held by the process that diverted them. Snapshotted here, in the same
-        # await-free window, so the pair cannot disagree.
-        reserve_state = list(self._replacement_reserve)
+        # Snapshot the dataloader, spare pool, and every admitted-but-untrained
+        # prompt as one checkpoint cut. The rollout pump holds this lock while
+        # turning a yielded batch into reserved buffer slots. If it is instead
+        # waiting at admission, _prefetched_dataloader_state rewinds to before
+        # that unaccounted batch.
+        async with self._rollout_checkpoint_lock:
+            dataloader_state = (
+                self._prefetched_dataloader_state
+                if self._prefetched_dataloader_state is not None
+                else self._dataloader.state_dict()
+            )
+            reserve_state = list(self._replacement_reserve)
+            pending_rollouts_state = self._buffer.pending_rollouts_state_dict()
+            journaled_ids = {
+                rollout["journal_id"] for rollout in pending_rollouts_state["rollouts"]
+            }
+            active_rollouts = [
+                dict(rollout)
+                for journal_id, rollout in self._active_rollout_prompts.items()
+                if journal_id not in journaled_ids
+            ]
+            pending_rollouts_state["rollouts"].extend(active_rollouts)
+            journaled_ids.update(rollout["journal_id"] for rollout in active_rollouts)
+            pending_rollouts_state["rollouts"].extend(
+                dict(rollout)
+                for rollout in self._pending_rollouts_to_regenerate
+                if rollout["journal_id"] not in journaled_ids
+            )
+            pending_rollouts_state["batch_shortfall"] = dict(self._batch_shortfall)
         # SC has no validation loop yet; drop the default sentinel instead of
         # persisting a bogus val_reward.
         if hasattr(save_state, "val_reward"):
@@ -1577,6 +1871,11 @@ class SingleControllerActor:
             torch.save,
             dataloader_state,
             os.path.join(checkpoint_path, "train_dataloader.pt"),
+        )
+        await asyncio.to_thread(
+            torch.save,
+            pending_rollouts_state,
+            os.path.join(checkpoint_path, _PENDING_ROLLOUTS_FILENAME),
         )
         if reserve_state:
             await asyncio.to_thread(

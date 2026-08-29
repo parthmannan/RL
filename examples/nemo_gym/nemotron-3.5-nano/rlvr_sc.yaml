@@ -40,6 +40,9 @@ checkpointing:
   ft_save_period: 1
   ft_keep_latest_k: 1
   save_optimizer: true
+  # Regenerate the exact untrained prompt journal after every resume instead
+  # of restoring the length-biased partial replay cohort.
+  load_replay_buffer: false
 
 # =============================================================================
 # GRPO
