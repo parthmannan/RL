@@ -295,10 +295,17 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
 
     conf = OmegaConf.merge(base, overlay)
 
-    # Inject runtime_env into TQ's actor spawn so SimpleStorageUnit /
-    # TransferQueueController land on workers with transfer_queue available
-    # — see _patch_tq_actor_runtime_env() docstring for the why.
-    _patch_tq_actor_runtime_env()
+    # Containers with TransferQueue baked into every node do not need Ray to
+    # clone the base venv and reinstall it for each TQ actor. That redundant
+    # runtime_env can be disabled explicitly by the launcher.
+    skip_runtime_env_install = os.environ.get(
+        "NRL_TQ_SKIP_RUNTIME_ENV_INSTALL", "0"
+    ).lower() in {"1", "true", "yes"}
+    if not skip_runtime_env_install:
+        # Inject runtime_env into TQ's actor spawn so SimpleStorageUnit /
+        # TransferQueueController land on workers with transfer_queue available
+        # — see _patch_tq_actor_runtime_env() docstring for the why.
+        _patch_tq_actor_runtime_env()
 
     # pyrefly: ignore  # bad-argument-type
     tq.init(conf=conf)
