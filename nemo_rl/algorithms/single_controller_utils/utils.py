@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+import statistics
 from collections import defaultdict
 from typing import Any
 
@@ -28,8 +29,11 @@ from tensordict import TensorDict
 
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_RESERVED_KEY_PREFIX,
+    ROLLOUT_ENV_EXTRA_TAG_PREFIX,
     ROLLOUT_ENVIRONMENT_TAG,
     ROLLOUT_GENERATION_LENGTH_TAG,
+    ROLLOUT_REWARD_TAG,
     ROLLOUT_TRUNCATED_TAG,
 )
 
@@ -60,6 +64,31 @@ def _rollout_environment_metric_component(environment: str) -> str:
         return sanitized
     digest = hashlib.blake2s(environment.encode(), digest_size=8).hexdigest()
     return f"{sanitized or 'unknown'}-{digest}"
+
+
+def _scalar_summary(
+    values: list[float],
+    prefix: str,
+    *,
+    mean_denominator: int | None = None,
+) -> dict[str, float]:
+    """Return the scalar portion of the legacy rollout metric family.
+
+    V1 divides sparse ``env_extras`` sums by the full environment cohort, not
+    by the number of samples that supplied that specific key. The optional
+    denominator preserves that behavior without carrying W&B Histogram objects
+    through checkpointed SingleController state.
+    """
+    denominator = mean_denominator if mean_denominator is not None else len(values)
+    return {
+        f"{prefix}/mean": sum(values) / denominator,
+        f"{prefix}/max": max(values),
+        f"{prefix}/min": min(values),
+        f"{prefix}/median": statistics.median(values),
+        f"{prefix}/stddev": statistics.stdev(values)
+        if len(values) > 1
+        else math.nan,
+    }
 
 
 def aggregate_step_metrics(train_result: dict[str, Any]) -> dict[str, Any]:
@@ -130,7 +159,13 @@ def reduce_advantage_pump_metrics(
     """
     out: dict[str, float] = {}
     if rewards:
-        out["reward"] = float(torch.cat([r.flatten() for r in rewards]).mean())
+        reward_values = (
+            torch.cat([reward.detach().flatten().cpu() for reward in rewards])
+            .tolist()
+        )
+        if reward_values:
+            out["reward"] = statistics.mean(reward_values)
+            out.update(_scalar_summary(reward_values, "total_reward"))
     if masked_advantages:
         cat = torch.cat([a.flatten() for a in masked_advantages])
         if cat.numel() > 0:
@@ -151,7 +186,7 @@ def reduce_advantage_pump_metrics(
 def reduce_rollout_length_metrics(
     rollout_tags: list[dict[str, Any]],
 ) -> dict[str, float]:
-    """Aggregate generated-token lengths by rollout environment.
+    """Aggregate generated-token lengths and rewards by rollout environment.
 
     The tags come from the ``KVBatchMeta`` chunks selected for one optimizer
     step, so streaming completion order cannot shift a sample into the wrong
@@ -161,72 +196,145 @@ def reduce_rollout_length_metrics(
         rollout_tags: Per-sample metadata tags accumulated across train chunks.
 
     Returns:
-        Global mean generation length plus per-environment count, mean, stddev,
-        min, p50, p95, max, and truncation rate when every sample is tagged.
-        Samples from an older checkpoint without diagnostic tags are reported as
-        missing; incomplete cohorts suppress the summaries rather than publish
-        biased statistics for only the tagged subset.
+        Global mean generation length, per-environment length summaries, and
+        legacy-style per-environment reward summaries when their respective tags
+        cover every sample. Missing tags are reported separately for lengths and
+        rewards; incomplete cohorts suppress only the affected summary family.
     """
     by_environment: dict[str, list[tuple[float, bool]]] = defaultdict(list)
-    missing_samples = 0
+    rewards_by_environment: dict[str, list[float]] = defaultdict(list)
+    extras_by_environment: dict[str, dict[str, list[float]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    environment_sample_counts: dict[str, int] = defaultdict(int)
+    missing_length_samples = 0
+    missing_reward_samples = 0
     for tag in rollout_tags:
         environment = tag.get(ROLLOUT_ENVIRONMENT_TAG)
+        valid_environment = isinstance(environment, str) and bool(environment)
+        if valid_environment:
+            environment_sample_counts[environment] += 1
         generation_length = tag.get(ROLLOUT_GENERATION_LENGTH_TAG)
         truncated = tag.get(ROLLOUT_TRUNCATED_TAG)
         if (
-            not isinstance(environment, str)
-            or not environment
+            not valid_environment
             or isinstance(generation_length, bool)
             or not isinstance(generation_length, (int, float))
             or not isinstance(truncated, bool)
         ):
-            missing_samples += 1
-            continue
-        generation_length = float(generation_length)
-        if not math.isfinite(generation_length) or generation_length < 0:
-            missing_samples += 1
-            continue
-        by_environment[environment].append((generation_length, truncated))
+            missing_length_samples += 1
+        else:
+            generation_length = float(generation_length)
+            if not math.isfinite(generation_length) or generation_length < 0:
+                missing_length_samples += 1
+            else:
+                by_environment[environment].append((generation_length, truncated))
 
-    tagged_samples = sum(len(rows) for rows in by_environment.values())
-    total_samples = tagged_samples + missing_samples
+        reward = tag.get(ROLLOUT_REWARD_TAG)
+        if (
+            not valid_environment
+            or isinstance(reward, bool)
+            or not isinstance(reward, (int, float))
+        ):
+            missing_reward_samples += 1
+        else:
+            reward = float(reward)
+            if not math.isfinite(reward):
+                missing_reward_samples += 1
+            else:
+                rewards_by_environment[environment].append(reward)
+
+        if valid_environment:
+            for tag_key, value in tag.items():
+                if not tag_key.startswith(ROLLOUT_ENV_EXTRA_TAG_PREFIX):
+                    continue
+                metric_key = tag_key.removeprefix(ROLLOUT_ENV_EXTRA_TAG_PREFIX)
+                if (
+                    not metric_key
+                    or metric_key.startswith(NEMO_GYM_RESERVED_KEY_PREFIX)
+                    or not isinstance(value, (bool, int, float))
+                ):
+                    continue
+                numeric_value = float(value)
+                if math.isfinite(numeric_value):
+                    extras_by_environment[environment][metric_key].append(
+                        numeric_value
+                    )
+
+    tagged_length_samples = sum(len(rows) for rows in by_environment.values())
+    tagged_reward_samples = sum(
+        len(values) for values in rewards_by_environment.values()
+    )
+    total_length_samples = tagged_length_samples + missing_length_samples
+    total_reward_samples = tagged_reward_samples + missing_reward_samples
     metrics: dict[str, float] = {
-        "rollout_length/tagged_samples": float(tagged_samples),
-        "rollout_length/missing_samples": float(missing_samples),
+        "rollout_length/tagged_samples": float(tagged_length_samples),
+        "rollout_length/missing_samples": float(missing_length_samples),
         "rollout_length/tag_coverage": (
-            tagged_samples / total_samples if total_samples else 0.0
+            tagged_length_samples / total_length_samples
+            if total_length_samples
+            else 0.0
+        ),
+        "rollout_reward/tagged_samples": float(tagged_reward_samples),
+        "rollout_reward/missing_samples": float(missing_reward_samples),
+        "rollout_reward/tag_coverage": (
+            tagged_reward_samples / total_reward_samples
+            if total_reward_samples
+            else 0.0
         ),
     }
     # Older checkpoints predate these tags. Mixing their rows with newly
     # generated rows and reporting only the tagged subset would make the first
     # resumed step look complete while excluding exactly the restored samples
     # under investigation.
-    if missing_samples or not tagged_samples:
-        return metrics
+    if not missing_length_samples and tagged_length_samples:
+        all_lengths: list[float] = []
+        for environment in sorted(by_environment):
+            rows = by_environment[environment]
+            lengths = np.asarray([length for length, _ in rows], dtype=np.float64)
+            all_lengths.extend(lengths.tolist())
+            metric_environment = _rollout_environment_metric_component(environment)
+            prefix = f"rollout_length/{metric_environment}"
+            metrics.update(
+                {
+                    f"{prefix}/count": float(len(rows)),
+                    f"{prefix}/mean": float(np.mean(lengths)),
+                    f"{prefix}/stddev": float(np.std(lengths)),
+                    f"{prefix}/min": float(np.min(lengths)),
+                    f"{prefix}/p50": float(np.percentile(lengths, 50)),
+                    f"{prefix}/p95": float(np.percentile(lengths, 95)),
+                    f"{prefix}/max": float(np.max(lengths)),
+                    f"{prefix}/truncation_rate": sum(
+                        truncated for _, truncated in rows
+                    )
+                    / len(rows),
+                }
+            )
 
-    all_lengths: list[float] = []
-    for environment in sorted(by_environment):
-        rows = by_environment[environment]
-        lengths = np.asarray([length for length, _ in rows], dtype=np.float64)
-        all_lengths.extend(lengths.tolist())
-        metric_environment = _rollout_environment_metric_component(environment)
-        prefix = f"rollout_length/{metric_environment}"
-        metrics.update(
-            {
-                f"{prefix}/count": float(len(rows)),
-                f"{prefix}/mean": float(np.mean(lengths)),
-                f"{prefix}/stddev": float(np.std(lengths)),
-                f"{prefix}/min": float(np.min(lengths)),
-                f"{prefix}/p50": float(np.percentile(lengths, 50)),
-                f"{prefix}/p95": float(np.percentile(lengths, 95)),
-                f"{prefix}/max": float(np.max(lengths)),
-                f"{prefix}/truncation_rate": sum(truncated for _, truncated in rows)
-                / len(rows),
-            }
-        )
-
-    if all_lengths:
         metrics["mean_gen_tokens_per_sample"] = float(np.mean(all_lengths))
+
+    if not missing_reward_samples and tagged_reward_samples:
+        for environment in sorted(rewards_by_environment):
+            values = rewards_by_environment[environment]
+            metric_environment = _rollout_environment_metric_component(environment)
+            prefix = f"{metric_environment}/reward"
+            metrics[f"{prefix}/count"] = float(len(values))
+            metrics.update(_scalar_summary(values, prefix))
+
+    for environment in sorted(extras_by_environment):
+        metric_environment = _rollout_environment_metric_component(environment)
+        denominator = environment_sample_counts[environment]
+        for metric_key in sorted(extras_by_environment[environment]):
+            values = extras_by_environment[environment][metric_key]
+            prefix = f"{metric_environment}/{metric_key}"
+            metrics[f"{prefix}/count"] = float(len(values))
+            metrics.update(
+                _scalar_summary(
+                    values,
+                    prefix,
+                    mean_denominator=denominator,
+                )
+            )
     return metrics
 
 

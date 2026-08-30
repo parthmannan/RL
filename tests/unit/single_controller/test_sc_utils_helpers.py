@@ -32,8 +32,10 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.experience.interfaces import (
+    ROLLOUT_ENV_EXTRA_TAG_PREFIX,
     ROLLOUT_ENVIRONMENT_TAG,
     ROLLOUT_GENERATION_LENGTH_TAG,
+    ROLLOUT_REWARD_TAG,
     ROLLOUT_TRUNCATED_TAG,
 )
 
@@ -146,6 +148,11 @@ class TestReduceAdvantagePumpMetrics:
             sequence_lengths=[4, 6],
         )
         assert out["reward"] == pytest.approx(2.0)
+        assert out["total_reward/mean"] == pytest.approx(2.0)
+        assert out["total_reward/stddev"] == pytest.approx(math.sqrt(2.0))
+        assert out["total_reward/min"] == pytest.approx(1.0)
+        assert out["total_reward/median"] == pytest.approx(2.0)
+        assert out["total_reward/max"] == pytest.approx(3.0)
         assert out["advantages/mean"] == pytest.approx(1.0 / 3.0)
         assert out["advantages/max"] == pytest.approx(2.0)
         assert out["advantages/min"] == pytest.approx(-1.0)
@@ -213,20 +220,26 @@ class TestReduceAdvantagePumpMetrics:
 
 class TestReduceRolloutLengthMetrics:
     @staticmethod
-    def _tag(environment: str, length: int, truncated: bool = False) -> dict:
+    def _tag(
+        environment: str,
+        length: int,
+        reward: float = 0.0,
+        truncated: bool = False,
+    ) -> dict:
         return {
             ROLLOUT_ENVIRONMENT_TAG: environment,
             ROLLOUT_GENERATION_LENGTH_TAG: length,
+            ROLLOUT_REWARD_TAG: reward,
             ROLLOUT_TRUNCATED_TAG: truncated,
         }
 
     def test_reduces_each_environment_and_global_mean(self) -> None:
         out = reduce_rollout_length_metrics(
             [
-                self._tag("env-a", 10),
-                self._tag("env-b", 5),
-                self._tag("env-a", 30, truncated=True),
-                self._tag("env-b", 15),
+                self._tag("env-a", 10, 1.0),
+                self._tag("env-b", 5, 0.0),
+                self._tag("env-a", 30, 3.0, truncated=True),
+                self._tag("env-b", 15, 2.0),
             ]
         )
 
@@ -243,6 +256,16 @@ class TestReduceRolloutLengthMetrics:
         assert out["rollout_length/tagged_samples"] == 4
         assert out["rollout_length/missing_samples"] == 0
         assert out["rollout_length/tag_coverage"] == 1
+        assert out["env-a/reward/count"] == 2
+        assert out["env-a/reward/mean"] == pytest.approx(2.0)
+        assert out["env-a/reward/stddev"] == pytest.approx(math.sqrt(2.0))
+        assert out["env-a/reward/min"] == pytest.approx(1.0)
+        assert out["env-a/reward/median"] == pytest.approx(2.0)
+        assert out["env-a/reward/max"] == pytest.approx(3.0)
+        assert out["env-b/reward/count"] == 2
+        assert out["rollout_reward/tagged_samples"] == 4
+        assert out["rollout_reward/missing_samples"] == 0
+        assert out["rollout_reward/tag_coverage"] == 1
 
     def test_metric_component_sanitization_does_not_collide(self) -> None:
         out = reduce_rollout_length_metrics(
@@ -257,6 +280,14 @@ class TestReduceRolloutLengthMetrics:
         ]
         assert len(encoded_keys) == 1
         assert out[encoded_keys[0]] == 12
+        assert out["env_a_b/reward/mean"] == 0
+        encoded_reward_keys = [
+            key
+            for key in out
+            if key.startswith("env_a_b-") and key.endswith("/reward/mean")
+        ]
+        assert len(encoded_reward_keys) == 1
+        assert out[encoded_reward_keys[0]] == 0
 
     def test_incomplete_legacy_cohort_only_reports_tag_coverage(self) -> None:
         assert reduce_rollout_length_metrics(
@@ -265,6 +296,9 @@ class TestReduceRolloutLengthMetrics:
             "rollout_length/tagged_samples": 1.0,
             "rollout_length/missing_samples": 1.0,
             "rollout_length/tag_coverage": 0.5,
+            "rollout_reward/tagged_samples": 1.0,
+            "rollout_reward/missing_samples": 1.0,
+            "rollout_reward/tag_coverage": 0.5,
         }
 
     def test_invalid_lengths_count_as_missing(self) -> None:
@@ -274,6 +308,15 @@ class TestReduceRolloutLengthMetrics:
             "rollout_length/tagged_samples": 0.0,
             "rollout_length/missing_samples": 2.0,
             "rollout_length/tag_coverage": 0.0,
+            "rollout_reward/tagged_samples": 2.0,
+            "rollout_reward/missing_samples": 0.0,
+            "rollout_reward/tag_coverage": 1.0,
+            "env-a/reward/count": 2.0,
+            "env-a/reward/mean": 0.0,
+            "env-a/reward/max": 0.0,
+            "env-a/reward/min": 0.0,
+            "env-a/reward/median": 0.0,
+            "env-a/reward/stddev": 0.0,
         }
 
     def test_empty_tags_report_empty_coverage(self) -> None:
@@ -281,7 +324,43 @@ class TestReduceRolloutLengthMetrics:
             "rollout_length/tagged_samples": 0.0,
             "rollout_length/missing_samples": 0.0,
             "rollout_length/tag_coverage": 0.0,
+            "rollout_reward/tagged_samples": 0.0,
+            "rollout_reward/missing_samples": 0.0,
+            "rollout_reward/tag_coverage": 0.0,
         }
+
+    def test_reduces_numeric_env_extras_with_v1_sparse_mean_semantics(self) -> None:
+        first = self._tag("env-a", 10, 1.0)
+        first.update(
+            {
+                f"{ROLLOUT_ENV_EXTRA_TAG_PREFIX}judge_score": 1.0,
+                f"{ROLLOUT_ENV_EXTRA_TAG_PREFIX}passed": True,
+                f"{ROLLOUT_ENV_EXTRA_TAG_PREFIX}sparse": 10.0,
+                f"{ROLLOUT_ENV_EXTRA_TAG_PREFIX}label": "ignored",
+                f"{ROLLOUT_ENV_EXTRA_TAG_PREFIX}_ng_task_index": 12,
+            }
+        )
+        second = self._tag("env-a", 20, 3.0)
+        second.update(
+            {
+                f"{ROLLOUT_ENV_EXTRA_TAG_PREFIX}judge_score": 3.0,
+                f"{ROLLOUT_ENV_EXTRA_TAG_PREFIX}passed": False,
+            }
+        )
+        third = self._tag("env-b", 30, 5.0)
+        third[f"{ROLLOUT_ENV_EXTRA_TAG_PREFIX}judge_score"] = 5.0
+
+        out = reduce_rollout_length_metrics([first, second, third])
+
+        assert out["env-a/judge_score/count"] == 2
+        assert out["env-a/judge_score/mean"] == pytest.approx(2.0)
+        assert out["env-a/judge_score/stddev"] == pytest.approx(math.sqrt(2.0))
+        assert out["env-a/passed/mean"] == pytest.approx(0.5)
+        assert out["env-a/sparse/count"] == 1
+        assert out["env-a/sparse/mean"] == pytest.approx(5.0)
+        assert out["env-b/judge_score/mean"] == pytest.approx(5.0)
+        assert not any("label" in key for key in out)
+        assert not any("_ng_task_index" in key for key in out)
 
 
 class TestFieldsForPut:

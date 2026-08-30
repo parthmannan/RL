@@ -26,8 +26,11 @@ from nemo_rl.data_plane.column_io import TOKEN_ALIGNED_FIELDS
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_RESERVED_KEY_PREFIX,
+    ROLLOUT_ENV_EXTRA_TAG_PREFIX,
     ROLLOUT_ENVIRONMENT_TAG,
     ROLLOUT_GENERATION_LENGTH_TAG,
+    ROLLOUT_REWARD_TAG,
     ROLLOUT_TRUNCATED_TAG,
     PromptGroupRecord,
 )
@@ -40,6 +43,10 @@ def record_to_rollout_tags(record: PromptGroupRecord) -> list[dict[str, Any]]:
     environments do not carry an agent reference, so their task name is the
     stable fallback. The generated length matches the existing rollout metric:
     all assistant-role tokens across every turn of a completion.
+
+    Public finite numeric values from ``env_extras`` are copied into flat,
+    prefixed tag entries. This preserves the primitive-only metadata contract
+    while allowing SingleController to reproduce V1's per-agent metrics.
 
     Args:
         record: Completed prompt group to summarize.
@@ -65,18 +72,31 @@ def record_to_rollout_tags(record: PromptGroupRecord) -> list[dict[str, Any]]:
     if environment is None:
         environment = "unknown"
 
-    return [
-        {
+    tags: list[dict[str, Any]] = []
+    for completion in record.completions:
+        tag: dict[str, Any] = {
             ROLLOUT_ENVIRONMENT_TAG: environment,
             ROLLOUT_GENERATION_LENGTH_TAG: sum(
                 len(message["token_ids"])
                 for message in completion.message_log
                 if message["role"] == "assistant"
             ),
+            ROLLOUT_REWARD_TAG: float(completion.reward),
             ROLLOUT_TRUNCATED_TAG: bool(completion.truncated),
         }
-        for completion in record.completions
-    ]
+        if isinstance(completion.env_extras, dict):
+            for key, value in completion.env_extras.items():
+                if (
+                    not isinstance(key, str)
+                    or key.startswith(NEMO_GYM_RESERVED_KEY_PREFIX)
+                    or not isinstance(value, (bool, int, float))
+                ):
+                    continue
+                numeric_value = float(value)
+                if np.isfinite(numeric_value):
+                    tag[f"{ROLLOUT_ENV_EXTRA_TAG_PREFIX}{key}"] = numeric_value
+        tags.append(tag)
+    return tags
 
 
 def record_to_train_batch(

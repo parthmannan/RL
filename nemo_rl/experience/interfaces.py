@@ -29,7 +29,9 @@ NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"
 # the metadata sidecar lets SingleController aggregate the exact cohort selected
 # for training without fetching tensor payloads back from the data plane.
 ROLLOUT_ENVIRONMENT_TAG = "rollout_environment"
+ROLLOUT_ENV_EXTRA_TAG_PREFIX = "rollout_env_extra:"
 ROLLOUT_GENERATION_LENGTH_TAG = "rollout_generation_length"
+ROLLOUT_REWARD_TAG = "rollout_reward"
 ROLLOUT_TRUNCATED_TAG = "rollout_truncated"
 
 

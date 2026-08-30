@@ -17,8 +17,10 @@ from __future__ import annotations
 import torch
 
 from nemo_rl.experience.interfaces import (
+    ROLLOUT_ENV_EXTRA_TAG_PREFIX,
     ROLLOUT_ENVIRONMENT_TAG,
     ROLLOUT_GENERATION_LENGTH_TAG,
+    ROLLOUT_REWARD_TAG,
     ROLLOUT_TRUNCATED_TAG,
     Completion,
     PromptGroupRecord,
@@ -119,11 +121,13 @@ def test_record_to_rollout_tags_uses_agent_and_assistant_tokens() -> None:
         {
             ROLLOUT_ENVIRONMENT_TAG: "citation_agent",
             ROLLOUT_GENERATION_LENGTH_TAG: 5,
+            ROLLOUT_REWARD_TAG: 1.0,
             ROLLOUT_TRUNCATED_TAG: False,
         },
         {
             ROLLOUT_ENVIRONMENT_TAG: "citation_agent",
             ROLLOUT_GENERATION_LENGTH_TAG: 2,
+            ROLLOUT_REWARD_TAG: 2.0,
             ROLLOUT_TRUNCATED_TAG: True,
         },
     ]
@@ -135,6 +139,27 @@ def test_record_to_rollout_tags_falls_back_to_native_task_name() -> None:
     record.metadata["task_name"] = " native-task "
 
     assert record_to_rollout_tags(record)[0][ROLLOUT_ENVIRONMENT_TAG] == "native-task"
+
+
+def test_record_to_rollout_tags_carries_only_public_finite_numeric_extras() -> None:
+    completion = _completion(route_start=10, reward=1.0)
+    completion.env_extras = {
+        "judge_score": 0.75,
+        "passed": True,
+        "_ng_task_index": 12,
+        "label": "correct",
+        "nested": {"value": 1},
+        "not_finite": float("nan"),
+    }
+
+    tag = record_to_rollout_tags(_record([completion]))[0]
+
+    assert tag[f"{ROLLOUT_ENV_EXTRA_TAG_PREFIX}judge_score"] == 0.75
+    assert tag[f"{ROLLOUT_ENV_EXTRA_TAG_PREFIX}passed"] == 1.0
+    assert not any("_ng_task_index" in key for key in tag)
+    assert not any("label" in key for key in tag)
+    assert not any("nested" in key for key in tag)
+    assert not any("not_finite" in key for key in tag)
 
 
 def test_record_to_train_batch_preserves_routed_experts_in_tq_payload() -> None:

@@ -31,6 +31,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import (
     ROLLOUT_ENVIRONMENT_TAG,
     ROLLOUT_GENERATION_LENGTH_TAG,
+    ROLLOUT_REWARD_TAG,
     ROLLOUT_TRUNCATED_TAG,
     Completion,
     PromptGroupRecord,
@@ -285,12 +286,14 @@ class TestTQReplayBufferReserveCommit:
                 "weight_version": 3,
                 ROLLOUT_ENVIRONMENT_TAG: "test-agent",
                 ROLLOUT_GENERATION_LENGTH_TAG: 1,
+                ROLLOUT_REWARD_TAG: 0.0,
                 ROLLOUT_TRUNCATED_TAG: False,
             },
             {
                 "weight_version": 3,
                 ROLLOUT_ENVIRONMENT_TAG: "test-agent",
                 ROLLOUT_GENERATION_LENGTH_TAG: 2,
+                ROLLOUT_REWARD_TAG: 0.0,
                 ROLLOUT_TRUNCATED_TAG: True,
             },
         ]

@@ -968,6 +968,7 @@ def test_train_pump_logs_rollout_lengths_for_selected_environment_chunks(
                     "weight_version": 0,
                     "rollout_environment": environment,
                     "rollout_generation_length": length,
+                    "rollout_reward": float(length) / 10,
                     "rollout_truncated": i == len(lengths) - 1,
                 }
                 for i, length in enumerate(lengths)
@@ -997,6 +998,14 @@ def test_train_pump_logs_rollout_lengths_for_selected_environment_chunks(
     assert train_metrics["rollout_length/tagged_samples"] == 4
     assert train_metrics["rollout_length/missing_samples"] == 0
     assert train_metrics["rollout_length/tag_coverage"] == 1
+    assert train_metrics["env-a/reward/count"] == 2
+    assert train_metrics["env-a/reward/mean"] == pytest.approx(2.0)
+    assert train_metrics["env-a/reward/stddev"] == pytest.approx(math.sqrt(2.0))
+    assert train_metrics["env-b/reward/count"] == 2
+    assert train_metrics["env-b/reward/mean"] == pytest.approx(1.0)
+    assert train_metrics["rollout_reward/tagged_samples"] == 4
+    assert train_metrics["rollout_reward/missing_samples"] == 0
+    assert train_metrics["rollout_reward/tag_coverage"] == 1
 
 
 def test_train_pump_keeps_train_buffers_once_the_step_is_open(monkeypatch) -> None:
