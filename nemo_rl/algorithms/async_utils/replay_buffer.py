@@ -826,6 +826,55 @@ class TQReplayBuffer:
             )
         for tag, rollout_tag in zip(tags, rollout_tags):
             tag.update(rollout_tag)
+
+        # Stamp per-prompt pass_rate from the raw dataset record onto every row's
+        # tag so the trainer can log dispatched-sample difficulty regardless of
+        # sampler ordering (ReadyFirst/Windowed do not preserve dataset order).
+        pass_rate = None
+        if isinstance(record.extra_env_info, dict):
+            raw_pr = record.extra_env_info.get("pass_rate")
+            if raw_pr is not None:
+                pass_rate = float(raw_pr)
+        # Per-group staleness = weight-version gap between rollout start and
+        # commit — a proxy for how many weight updates happened while this
+        # rollout was in flight. Same value across all N rows of a group, so
+        # the trainer-side mean over rows equals mean over groups.
+        staleness = int(end_weight_version) - int(start_weight_version)
+        for t in tags:
+            t["pass_rate"] = pass_rate
+            t["staleness"] = staleness
+
+        # Stamp scalar rollout_metrics on the *first* row's tag only, so the
+        # SingleController train pump can log per-agent reward stats (already
+        # computed by NemoGymRolloutManager._compute_rollout_metrics but
+        # otherwise dropped by this codepath). One tag per group avoids the 8x
+        # duplication we'd get from stamping every row, and gives the trainer a
+        # natural per-group dedup key. Histograms and tables are non-scalar and
+        # would not round-trip through the reducer; drop them here.
+        scalar_metrics = {
+            k: float(v)
+            for k, v in record.rollout_metrics.items()
+            if isinstance(v, (bool, int, float))
+        }
+        if scalar_metrics:
+            tags[0]["rollout_metrics"] = scalar_metrics
+
+        # Stamp the raw dataset source on the group's first row tag only. Blend
+        # composition is a per-prompt-group property (all N generations of a
+        # group share the same source), so one tag per group is the right
+        # unit -- and mirrors rollout_metrics rather than pass_rate to keep
+        # the payload small. The train pump on the SC side accumulates these
+        # into a Counter[str] and emits a per-step JSON so the exact blend
+        # the trainer actually consumed is inspectable per step, independent
+        # of the sampler's ordering.
+        dataset_source = None
+        if isinstance(record.extra_env_info, dict):
+            raw_ds = record.extra_env_info.get("dataset")
+            if raw_ds is not None:
+                dataset_source = str(raw_ds)
+        if dataset_source is not None:
+            tags[0]["dataset_source"] = dataset_source
+
         if self._require_routed_experts and ROUTED_EXPERTS_FIELD not in fields:
             raise RuntimeError(
                 "policy.router_replay.enabled=true requires routed_experts in "

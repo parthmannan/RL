@@ -331,7 +331,7 @@ policy:
 
     vllm_kwargs:
       attention_backend: FLASH_ATTN
-      max_num_seqs: 64
+      max_num_seqs: 1024
       mamba_ssm_cache_dtype: "float32"
       compilation_config:
         cudagraph_capture_sizes: [1,2,4,8,16,32,64]

@@ -64,6 +64,7 @@ policy:
 # SingleController async RL
 # =============================================================================
 async_rl:
+  importance_sampling_diagnostics: true
   # in_order at lag 1 is the SC analogue of the baseline's
   # async_grpo.max_trajectory_age_steps: 1 — generation may run at most one
   # dispatch batch ahead of the trainer, and a step closes only on the cohort

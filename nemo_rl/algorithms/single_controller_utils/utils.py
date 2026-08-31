@@ -21,6 +21,7 @@ import math
 import re
 import statistics
 from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -90,6 +91,325 @@ def _scalar_summary(
         else math.nan,
     }
 
+_MAX_IMPORTANCE_DIAGNOSTIC_SEQUENCES_PER_LAG = 16
+
+
+@dataclass
+class _ImportanceSamplingBucket:
+    """Sufficient statistics for sampled sequences in one lag bucket."""
+
+    num_sequences: int = 0
+    num_tokens: int = 0
+    num_nonfinite_tokens: int = 0
+    log_ratio_sum: float = 0.0
+    abs_log_ratio_sum: float = 0.0
+    tis_oob_count: int = 0
+    objective_signal_sum: float = 0.0
+
+    def update(
+        self,
+        *,
+        finite_token_count: int,
+        nonfinite_token_count: int,
+        log_ratio_sum: float,
+        abs_log_ratio_sum: float,
+        tis_oob_count: int,
+        objective_signal_sum: float,
+    ) -> None:
+        self.num_sequences += 1
+        self.num_tokens += finite_token_count
+        self.num_nonfinite_tokens += nonfinite_token_count
+        self.log_ratio_sum += log_ratio_sum
+        self.abs_log_ratio_sum += abs_log_ratio_sum
+        self.tis_oob_count += tis_oob_count
+        self.objective_signal_sum += objective_signal_sum
+
+    def mean(self, total: float) -> float:
+        return total / self.num_tokens if self.num_tokens else 0.0
+
+
+@dataclass
+class ImportanceSamplingDiagnosticsAccumulator:
+    """Accumulate raw actor/behavior log-ratio diagnostics for one train step."""
+
+    use_importance_sampling_correction: bool
+    sequence_level_importance_ratios: bool
+    truncated_importance_sampling_ratio: float | None
+    truncated_importance_sampling_ratio_min: float | None
+    truncated_importance_sampling_type: str | None
+    _rows: list[dict[str, Any]] = field(default_factory=list, init=False)
+    _all_bucket: _ImportanceSamplingBucket = field(
+        default_factory=_ImportanceSamplingBucket, init=False
+    )
+    _buckets_by_lag: dict[int, _ImportanceSamplingBucket] = field(
+        default_factory=dict, init=False
+    )
+    _population_sequences_by_lag: dict[int, int] = field(
+        default_factory=dict, init=False
+    )
+
+    def _post_tis_weights(
+        self, log_ratios: torch.Tensor, finite_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        upper = self.truncated_importance_sampling_ratio
+        lower = self.truncated_importance_sampling_ratio_min
+        tis_type = self.truncated_importance_sampling_type
+        finite_log_ratios = torch.where(finite_mask, log_ratios, 0.0)
+        raw_token_weights = torch.nan_to_num(
+            torch.exp(finite_log_ratios), nan=0.0, posinf=0.0, neginf=0.0
+        )
+
+        def outside_bounds(value: torch.Tensor) -> torch.Tensor:
+            result = torch.zeros_like(value, dtype=torch.bool)
+            if upper is not None:
+                result |= value > math.log(upper)
+            if lower is not None and lower > 0:
+                result |= value < math.log(lower)
+            return result
+
+        if self.sequence_level_importance_ratios:
+            sequence_log_ratio = finite_log_ratios.sum(dim=1, keepdim=True)
+            sequence_weight = torch.nan_to_num(
+                torch.exp(sequence_log_ratio), nan=0.0, posinf=0.0, neginf=0.0
+            )
+            raw_weights = sequence_weight.expand_as(raw_token_weights)
+            oob = outside_bounds(sequence_log_ratio).expand_as(log_ratios)
+        elif tis_type == "seq-mask-tis":
+            sequence_mean_log_ratio = finite_log_ratios.sum(
+                dim=1, keepdim=True
+            ) / finite_mask.sum(dim=1, keepdim=True).clamp_min(1)
+            raw_weights = raw_token_weights
+            oob = outside_bounds(sequence_mean_log_ratio).expand_as(log_ratios)
+        else:
+            raw_weights = raw_token_weights
+            oob = torch.zeros_like(log_ratios, dtype=torch.bool)
+            if upper is not None:
+                oob |= log_ratios > math.log(upper)
+            if lower is not None and lower > 0:
+                oob |= log_ratios < math.log(lower)
+        oob = oob & finite_mask
+
+        if tis_type is None:
+            return raw_weights, oob
+        if tis_type == "tis":
+            assert upper is not None
+            return raw_weights.clamp(min=lower or 0.0, max=upper), oob
+        if tis_type == "icepop":
+            return torch.where(oob, torch.zeros_like(raw_weights), raw_weights), oob
+        if tis_type == "seq-mask-tis":
+            sequence_oob = oob.any(dim=1, keepdim=True)
+            return (
+                torch.where(sequence_oob, torch.zeros_like(raw_weights), raw_weights),
+                oob,
+            )
+        raise ValueError(f"unsupported truncated importance sampling type: {tis_type}")
+
+    def record(
+        self,
+        *,
+        step: int,
+        trainer_version: int,
+        sample_ids: list[str],
+        rollout_weight_versions: list[int],
+        sequence_lengths: list[int] | None,
+        prev_logprobs: torch.Tensor,
+        generation_logprobs: torch.Tensor,
+        token_mask: torch.Tensor,
+        sample_mask: torch.Tensor,
+        advantages: torch.Tensor,
+        rewards: torch.Tensor,
+    ) -> None:
+        """Record one selected sampler tranche before its optimizer update."""
+        batch_size = prev_logprobs.shape[0]
+        if not (
+            len(sample_ids) == len(rollout_weight_versions) == batch_size
+            and rewards.numel() == batch_size
+            and (sequence_lengths is None or len(sequence_lengths) == batch_size)
+            and all(
+                tensor.shape[0] == batch_size
+                for tensor in (
+                    prev_logprobs,
+                    generation_logprobs,
+                    token_mask,
+                    sample_mask,
+                    advantages,
+                )
+            )
+        ):
+            raise ValueError(
+                "importance-sampling diagnostic batch metadata is misaligned"
+            )
+
+        selected_indices: list[int] = []
+        selected_lags: list[int] = []
+        selected_this_call: dict[int, int] = {}
+        for i, rollout_version in enumerate(rollout_weight_versions):
+            lag = int(trainer_version - int(rollout_version))
+            self._population_sequences_by_lag[lag] = (
+                self._population_sequences_by_lag.get(lag, 0) + 1
+            )
+            bucket = self._buckets_by_lag.get(lag)
+            already_selected = bucket.num_sequences if bucket is not None else 0
+            if (
+                already_selected + selected_this_call.get(lag, 0)
+                < _MAX_IMPORTANCE_DIAGNOSTIC_SEQUENCES_PER_LAG
+            ):
+                selected_indices.append(i)
+                selected_lags.append(lag)
+                selected_this_call[lag] = selected_this_call.get(lag, 0) + 1
+
+        if not selected_indices:
+            return
+
+        selected = torch.tensor(selected_indices, device=prev_logprobs.device)
+        log_ratios = (
+            prev_logprobs.index_select(0, selected)[:, 1:]
+            - generation_logprobs.index_select(0, selected)[:, 1:]
+        ).float()
+        valid_mask = token_mask.index_select(0, selected)[:, 1:].bool()
+        valid_mask &= sample_mask.index_select(0, selected).bool().unsqueeze(-1)
+        finite_mask = valid_mask & torch.isfinite(log_ratios)
+        finite_log_ratios = torch.where(finite_mask, log_ratios, 0.0)
+        token_advantages = advantages.index_select(0, selected)[:, 1:].float()
+        post_tis_weights, oob_mask = self._post_tis_weights(log_ratios, finite_mask)
+        objective_weights = (
+            post_tis_weights
+            if self.use_importance_sampling_correction
+            else torch.ones_like(post_tis_weights)
+        )
+        objective_signal = torch.where(
+            finite_mask, token_advantages.abs() * objective_weights, 0.0
+        )
+        response_token_counts = valid_mask.sum(dim=1)
+        finite_token_counts = finite_mask.sum(dim=1)
+        stats = (
+            torch.stack(
+                (
+                    response_token_counts,
+                    finite_token_counts,
+                    finite_log_ratios.sum(dim=1),
+                    finite_log_ratios.abs().sum(dim=1),
+                    oob_mask.sum(dim=1),
+                    objective_signal.sum(dim=1),
+                    (token_advantages.ne(0) & finite_mask).sum(dim=1),
+                    rewards.flatten().index_select(0, selected),
+                ),
+                dim=1,
+            )
+            .detach()
+            .cpu()
+        )
+
+        for row_index, (i, lag) in enumerate(zip(selected_indices, selected_lags)):
+            (
+                response_token_count_value,
+                finite_token_count_value,
+                log_ratio_sum_value,
+                abs_log_ratio_sum_value,
+                tis_oob_count_value,
+                objective_signal_sum_value,
+                nonzero_advantage_count_value,
+                reward_value,
+            ) = stats[row_index].tolist()
+            response_token_count = int(response_token_count_value)
+            finite_token_count = int(finite_token_count_value)
+            nonfinite_token_count = response_token_count - finite_token_count
+            log_ratio_sum = float(log_ratio_sum_value)
+            abs_log_ratio_sum = float(abs_log_ratio_sum_value)
+            tis_oob_count = int(tis_oob_count_value)
+            objective_signal_sum = float(objective_signal_sum_value)
+            denominator = finite_token_count or 1
+            sequence_mean_log_ratio = log_ratio_sum / denominator
+            token_abs_log_ratio_mean = abs_log_ratio_sum / denominator
+            tis_oob_fraction = tis_oob_count / denominator
+            nonzero_advantage_fraction = (
+                float(nonzero_advantage_count_value) / denominator
+            )
+            objective_signal_proxy_mean = objective_signal_sum / denominator
+
+            for bucket in (
+                self._all_bucket,
+                self._buckets_by_lag.setdefault(lag, _ImportanceSamplingBucket()),
+            ):
+                bucket.update(
+                    finite_token_count=finite_token_count,
+                    nonfinite_token_count=nonfinite_token_count,
+                    log_ratio_sum=log_ratio_sum,
+                    abs_log_ratio_sum=abs_log_ratio_sum,
+                    tis_oob_count=tis_oob_count,
+                    objective_signal_sum=objective_signal_sum,
+                )
+
+            self._rows.append(
+                {
+                    "step": int(step),
+                    "sample_id": sample_ids[i],
+                    "observed_lag": lag,
+                    "total_sequence_length": (
+                        int(sequence_lengths[i])
+                        if sequence_lengths is not None
+                        else None
+                    ),
+                    "response_token_count": response_token_count,
+                    "nonfinite_log_ratio_token_count": nonfinite_token_count,
+                    "reward": float(reward_value),
+                    "raw_sequence_mean_log_ratio": sequence_mean_log_ratio,
+                    "raw_token_abs_log_ratio_mean": token_abs_log_ratio_mean,
+                    "tis_oob_fraction": tis_oob_fraction,
+                    "nonzero_advantage_fraction": nonzero_advantage_fraction,
+                    "objective_signal_proxy_mean": objective_signal_proxy_mean,
+                }
+            )
+
+    @staticmethod
+    def _summarize_bucket(
+        *, label: str, bucket: _ImportanceSamplingBucket, population: int
+    ) -> dict[str, float]:
+        prefix = f"importance_sampling/{label}"
+        return {
+            f"{prefix}/num_sequences": float(bucket.num_sequences),
+            f"{prefix}/population_num_sequences": float(population),
+            f"{prefix}/sequence_sample_fraction": (
+                bucket.num_sequences / population if population else 0.0
+            ),
+            f"{prefix}/num_tokens": float(bucket.num_tokens),
+            f"{prefix}/num_nonfinite_tokens": float(bucket.num_nonfinite_tokens),
+            f"{prefix}/raw_token_log_ratio_mean": bucket.mean(bucket.log_ratio_sum),
+            f"{prefix}/raw_token_abs_log_ratio_mean": bucket.mean(
+                bucket.abs_log_ratio_sum
+            ),
+            f"{prefix}/tis_oob_fraction": bucket.mean(float(bucket.tis_oob_count)),
+            f"{prefix}/objective_signal_proxy_mean": bucket.mean(
+                bucket.objective_signal_sum
+            ),
+        }
+
+    def flush(self) -> tuple[dict[str, float], list[dict[str, Any]]]:
+        """Return step metrics and rows, then reset the accumulator."""
+        if not self._rows:
+            return {}, []
+
+        metrics = self._summarize_bucket(
+            label="all",
+            bucket=self._all_bucket,
+            population=sum(self._population_sequences_by_lag.values()),
+        )
+        for lag, bucket in sorted(self._buckets_by_lag.items()):
+            metrics.update(
+                self._summarize_bucket(
+                    label=f"lag_{lag}",
+                    bucket=bucket,
+                    population=self._population_sequences_by_lag[lag],
+                )
+            )
+
+        rows = self._rows
+        self._rows = []
+        self._all_bucket = _ImportanceSamplingBucket()
+        self._buckets_by_lag = {}
+        self._population_sequences_by_lag = {}
+        return metrics, rows
+
 
 def aggregate_step_metrics(train_result: dict[str, Any]) -> dict[str, Any]:
     """Reduce per-microbatch metric lists into step-level scalars.
@@ -143,6 +463,9 @@ def reduce_advantage_pump_metrics(
     masked_advantages: list[torch.Tensor],
     sequence_lengths: list[int],
     seq_logprob_error_metrics: list[dict[str, float]] | None = None,
+    pass_rates: list[float] | None = None,
+    stalenesses: list[int] | None = None,
+    intended_pass_rates: list[float] | None = None,
 ) -> dict[str, float]:
     """Reduce per-step accumulators from _advantage_stage into step scalars.
 
@@ -152,10 +475,24 @@ def reduce_advantage_pump_metrics(
         sequence_lengths: All input_lengths trained on this step.
         seq_logprob_error_metrics: Sequence-error metrics and their aggregation
             counts, one record per streaming chunk.
+        pass_rates: Per-dispatched-sample dataset pass_rate values accumulated
+            over the training step (may span multiple sampler dispatches).
+        stalenesses: Per-dispatched-sample staleness values (end_weight -
+            start_weight at commit time). Same value across the N rows of one
+            group, so mean-over-rows equals mean-over-groups.
+        intended_pass_rates: Per-prompt dataset pass_rate values collected by
+            _rollout_pump for every loader batch admitted since the last
+            optimizer step. Reflects what the dataloader intended to feed;
+            compare against pass_rate/* (what the trainer actually consumed)
+            to spot sampler-driven difficulty skew.
 
     Returns:
-        Step-level reward, advantage, token-count, and optional sequence
-        log-probability error metrics.
+        Step-level reward, advantage, token-count, optional sequence
+        log-probability error metrics,
+        pass_rate/{mean,std,min,max,num_samples} when pass_rates is non-empty,
+        staleness/{mean,min,max} when stalenesses is non-empty, and
+        intended_pass_rate/{mean,min,max,num_prompts} when intended_pass_rates
+        is non-empty.
     """
     out: dict[str, float] = {}
     if rewards:
@@ -180,6 +517,24 @@ def reduce_advantage_pump_metrics(
         out["total_num_tokens"] = float(sum(sequence_lengths))
     if seq_logprob_error_metrics:
         out.update(_reduce_seq_logprob_error_metrics(seq_logprob_error_metrics))
+    if pass_rates:
+        arr = np.asarray(pass_rates, dtype=np.float64)
+        out["pass_rate/mean"] = float(arr.mean())
+        out["pass_rate/std"] = float(arr.std())
+        out["pass_rate/min"] = float(arr.min())
+        out["pass_rate/max"] = float(arr.max())
+        out["pass_rate/num_samples"] = float(arr.size)
+    if stalenesses:
+        arr = np.asarray(stalenesses, dtype=np.float64)
+        out["staleness/mean"] = float(arr.mean())
+        out["staleness/min"] = float(arr.min())
+        out["staleness/max"] = float(arr.max())
+    if intended_pass_rates:
+        arr = np.asarray(intended_pass_rates, dtype=np.float64)
+        out["intended_pass_rate/mean"] = float(arr.mean())
+        out["intended_pass_rate/min"] = float(arr.min())
+        out["intended_pass_rate/max"] = float(arr.max())
+        out["intended_pass_rate/num_prompts"] = float(arr.size)
     return out
 
 

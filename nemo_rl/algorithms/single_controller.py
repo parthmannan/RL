@@ -35,12 +35,13 @@ Data flow:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import os
 import time
 import uuid
-from collections import deque
+from collections import Counter, deque
 from functools import partial
 from typing import Any, Awaitable, Callable, Optional, Union
 
@@ -51,6 +52,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     _write_latest_checkpoint_status,
+    aggregate_rollout_metrics,
     compute_and_apply_seq_logprob_error_masking,
 )
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
@@ -62,6 +64,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.algorithms.single_controller_utils.utils import (
+    ImportanceSamplingDiagnosticsAccumulator,
     aggregate_step_metrics,
     fields_for_put,
     reduce_advantage_pump_metrics,
@@ -131,9 +134,33 @@ class SingleControllerActor:
 
         self._master_config = master_config
         self._async_cfg = master_config.async_rl
-        self._policy_logprobs_required = not (
-            master_config.loss_fn.force_on_policy_ratio
-            and master_config.grpo.seq_logprob_error_threshold is None
+        self._importance_sampling_diagnostics = (
+            ImportanceSamplingDiagnosticsAccumulator(
+                use_importance_sampling_correction=(
+                    master_config.loss_fn.use_importance_sampling_correction
+                ),
+                sequence_level_importance_ratios=(
+                    master_config.loss_fn.sequence_level_importance_ratios
+                ),
+                truncated_importance_sampling_ratio=(
+                    master_config.loss_fn.truncated_importance_sampling_ratio
+                ),
+                truncated_importance_sampling_ratio_min=(
+                    master_config.loss_fn.truncated_importance_sampling_ratio_min
+                ),
+                truncated_importance_sampling_type=(
+                    master_config.loss_fn.truncated_importance_sampling_type
+                ),
+            )
+            if self._async_cfg.importance_sampling_diagnostics
+            else None
+        )
+        self._policy_logprobs_required = (
+            not (
+                master_config.loss_fn.force_on_policy_ratio
+                and master_config.grpo.seq_logprob_error_threshold is None
+            )
+            or self._importance_sampling_diagnostics is not None
         )
         self._reference_logprobs_required = not bool(
             master_config.grpo.skip_reference_policy_logprobs_calculation
@@ -269,13 +296,42 @@ class SingleControllerActor:
         self._trainer_version: int = actor_args.save_state.current_step
         self._train_steps: int = actor_args.save_state.current_step
         self._current_epoch: int = actor_args.save_state.current_epoch
+        # Diagnostic counter: monotonic tally of loader batches admitted this
+        # run. Reset each run — the wandb step for intended_pass_rate now
+        # comes from _train_steps at the optimizer boundary, so persistence
+        # across resumes is no longer needed.
+        self._loader_batches_seen: int = 0
         self._step_log_dict: dict[str, list] = {
             "rewards": [],
             "masked_advantages": [],
             "sequence_lengths": [],
             "seq_logprob_error_metrics": [],
             "rollout_tags": [],
+            "pass_rates": [],
+            "stalenesses": [],
+            # intended_pass_rates: per-prompt dataset pass_rate values collected
+            # in _rollout_pump for each loader batch admitted since the last
+            # optimizer step. Emitted alongside actual pass_rate at the train
+            # step boundary — logging from _rollout_pump directly would race
+            # _train_pump on wandb's monotonic step counter and cause the
+            # trainer's own logs (step_metrics, timing_metrics) to be dropped.
+            "intended_pass_rates": [],
         }
+        # Per-metric-name → list of per-group values collected across all
+        # dispatches within one training step. Reduced via
+        # aggregate_rollout_metrics at the optimizer boundary.
+        self._step_rollout_metrics: dict[str, list[float]] = {}
+
+        # Per-step blend composition. _step_dataset_sources counts the raw
+        # dataset source of every prompt group the trainer consumed since the
+        # last optimizer step; at step close we snapshot it into
+        # _dataset_composition_history keyed by _train_steps and rewrite
+        # {log_dir}/dataset_composition.json. Percentages plus raw counts are
+        # both recorded so a step that shrank under drop/replace stays
+        # explainable after the fact. Kept separate from _step_log_dict
+        # because the reducer expects numeric lists, not strings.
+        self._step_dataset_sources: Counter[str] = Counter()
+        self._dataset_composition_history: dict[int, dict[str, Any]] = {}
 
         print(
             f"SingleControllerActor: "
@@ -588,6 +644,34 @@ class SingleControllerActor:
 
     # ── the three pumps + the inline advantage stage ───────────────────────
 
+    def _accumulate_intended_pass_rate(self, prompt_batch: Any) -> None:
+        """Buffer the loader batch's per-prompt dataset pass_rate values.
+
+        Runs in _rollout_pump for every admitted loader batch. Values are
+        reduced and logged from _train_pump at the optimizer boundary via
+        reduce_advantage_pump_metrics so there's exactly one wandb log call
+        per training step — logging inline from the rollout pump would race
+        wandb's monotonic step counter against _train_pump and silently drop
+        the trainer's own step_metrics / timing_metrics.
+
+        pass_rate is per-prompt and lives inside the DatumSpec's
+        extra_env_info dict for NeMo-Gym prompts (populated from the raw
+        JSONL row by nemo_gym_data_processor). Records missing pass_rate
+        (e.g. ultra_rlhf_*) are skipped; num_prompts in the emitted metric
+        surfaces how many contributed. _loader_batches_seen still ticks
+        forward so the counter is honest even for empty / all-missing
+        batches.
+        """
+        self._loader_batches_seen += 1
+        extras = prompt_batch.get("extra_env_info")
+        if not extras:
+            return
+        self._step_log_dict["intended_pass_rates"].extend(
+            float(info["pass_rate"])
+            for info in extras
+            if isinstance(info, dict) and info.get("pass_rate") is not None
+        )
+
     async def _rollout_pump(self) -> None:
         """Continuously dispatch rollout tasks until cancellation.
 
@@ -846,6 +930,12 @@ class SingleControllerActor:
                     )
                     if target_step is not None:
                         self._sampler_stamps_target_steps = True
+
+                    # Buffer this loader batch's pass_rates. Reduced and logged
+                    # from _train_pump at the optimizer boundary — one log call
+                    # per train step keeps wandb's monotonic step counter
+                    # single-writer.
+                    self._accumulate_intended_pass_rate(prompt_batch)
 
                     num_prompts = prompt_batch.size
                     if target_step is not None:
@@ -1291,6 +1381,47 @@ class SingleControllerActor:
                     else:
                         min_sample_version = curr_min_sample_version
 
+                    # Accumulate per-sample pass_rate from tags stamped in
+                    # ReplayBufferImpl.commit(). Aggregated at the optimizer-step
+                    # boundary below, so it survives multi-dispatch train steps
+                    # under ReadyFirst/Windowed samplers.
+                    self._step_log_dict["pass_rates"].extend(
+                        t["pass_rate"]
+                        for t in train_meta.tags  # type: ignore
+                        if t.get("pass_rate") is not None
+                    )
+                    # Per-sample staleness (end_weight - start_weight from
+                    # commit()) — reports how much weight drift the batch
+                    # experienced during rollout generation.
+                    self._step_log_dict["stalenesses"].extend(
+                        t["staleness"]
+                        for t in train_meta.tags  # type: ignore
+                        if t.get("staleness") is not None
+                    )
+
+                    # Accumulate per-group rollout_metrics stamped on the first
+                    # tag of each group. Values are per-prompt-group scalars
+                    # (mean/max/min already reduced over N completions in
+                    # _compute_rollout_metrics); we buffer them per key and let
+                    # aggregate_rollout_metrics reduce across groups at the
+                    # optimizer step below.
+                    for t in train_meta.tags:  # type: ignore
+                        group_metrics = t.get("rollout_metrics")
+                        if not group_metrics:
+                            continue
+                        for k, v in group_metrics.items():
+                            self._step_rollout_metrics.setdefault(k, []).append(v)
+
+                    # Accumulate per-group dataset sources for the composition
+                    # dump. Stamped on the first row of each group in
+                    # TQReplayBuffer.commit(), so exactly one contribution per
+                    # prompt group -- percentages track prompt-group share of
+                    # the batch, not row share.
+                    for t in train_meta.tags:  # type: ignore
+                        ds = t.get("dataset_source")
+                        if ds is not None:
+                            self._step_dataset_sources[ds] += 1
+
                     # Remove consumed sample_ids from the buffer
                     await self._call_dp(
                         "clear_samples",
@@ -1351,6 +1482,47 @@ class SingleControllerActor:
                     reduce_rollout_length_metrics(self._step_log_dict["rollout_tags"])
                 )
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
+                diagnostic_rows: list[dict[str, Any]] = []
+                if self._importance_sampling_diagnostics is not None:
+                    diagnostic_metrics, diagnostic_rows = (
+                        self._importance_sampling_diagnostics.flush()
+                    )
+                    step_metrics.update(diagnostic_metrics)
+
+                # Reduce per-group rollout_metrics (reward stats, per-agent
+                # scalars, turn/token/truncation rates) into per-step scalars
+                # and merge into step_metrics so they log under the train/
+                # prefix. Fills the "rollout_metrics" TODO the sync grpo/ppo
+                # loops already cover via aggregate_rollout_metrics.
+                # (self._batch_shortfall.pop() from the source commit is
+                # dropped here: the new lineage already prunes _batch_shortfall
+                # via the dict-comprehension a few lines below, which is a
+                # strict superset -- popping just this step's entry then would
+                # leak stragglers stamped for a step that was already closed.)
+                if self._step_rollout_metrics:
+                    step_metrics.update(
+                        aggregate_rollout_metrics(self._step_rollout_metrics)
+                    )
+                self._step_rollout_metrics = {}
+
+                # Snapshot the just-closed step's dataset-source composition
+                # and rewrite the on-disk history. version_during_step is the
+                # step's zero-indexed identifier -- same key _batch_shortfall
+                # uses -- so the JSON reads as {"0": {...}, "1": {...}, ...}.
+                # Percentages and raw counts are both recorded so a step that
+                # shrank under drop/replace stays explainable after the fact.
+                if self._step_dataset_sources:
+                    total = sum(self._step_dataset_sources.values())
+                    self._dataset_composition_history[version_during_step] = {
+                        "counts": dict(self._step_dataset_sources),
+                        "percentages": {
+                            k: v / total
+                            for k, v in self._step_dataset_sources.items()
+                        },
+                        "total_groups": total,
+                    }
+                    self._write_dataset_composition()
+                    self._step_dataset_sources = Counter()
 
                 self._trainer_version += 1
                 self._train_steps += 1
@@ -1381,6 +1553,14 @@ class SingleControllerActor:
                     for step, promoted in self._batch_promotions.items()
                     if step > version_during_step
                 }
+                if diagnostic_rows:
+                    self._logger.log_string_list_as_jsonl(
+                        [json.dumps(row, sort_keys=True) for row in diagnostic_rows],
+                        (
+                            "importance_sampling/"
+                            f"train_data_step{self._train_steps}.jsonl"
+                        ),
+                    )
                 with self._timer.time("weight_sync"):
                     calibration_data = (
                         BatchedDataDict.from_batches(calibration_batches)
@@ -1787,6 +1967,29 @@ class SingleControllerActor:
         )
         return len(stale_tasks)
 
+    def _write_dataset_composition(self) -> None:
+        """Atomically rewrite {log_dir}/dataset_composition.json.
+
+        Runs on every optimizer step boundary that produced any dataset-source
+        stamps -- rewrites the whole history each time (bounded at low
+        hundreds of KiB for a full campaign, so cheap enough to not batch)
+        via write-to-tmp + os.replace, so a crash mid-write leaves the
+        previous complete file rather than truncated JSON. No-ops if the
+        logger config carries no log_dir, so unit tests that construct the
+        actor without a run directory do not need a temp path.
+        """
+        log_dir = self._master_config.logger.get("log_dir")
+        if not log_dir:
+            return
+        out_path = os.path.join(log_dir, "dataset_composition.json")
+        tmp_path = out_path + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(
+                self._dataset_composition_history, f, indent=2, sort_keys=True
+            )
+        os.replace(tmp_path, out_path)
+
+
     async def _save_checkpoint(self, step_metrics: dict[str, Any]) -> None:
         """Write a full checkpoint for the just-finished train step.
 
@@ -2088,6 +2291,28 @@ class SingleControllerActor:
         self._step_log_dict["masked_advantages"].append(
             response_advantages.detach().cpu()
         )
+        if self._importance_sampling_diagnostics is not None:
+            if meta.tags is None:
+                raise ValueError(
+                    "importance-sampling diagnostics require rollout weight-version tags"
+                )
+            self._importance_sampling_diagnostics.record(
+                step=self._train_steps + 1,
+                trainer_version=self._trainer_version,
+                sample_ids=list(meta.sample_ids),
+                rollout_weight_versions=[
+                    int(tag["weight_version"]) for tag in meta.tags
+                ],
+                sequence_lengths=meta.sequence_lengths,
+                prev_logprobs=tensor_field(data, adv_cfg.policy_logprobs_field),
+                generation_logprobs=tensor_field(
+                    data, adv_cfg.generation_logprobs_field
+                ),
+                token_mask=token_mask,
+                sample_mask=sample_mask,
+                advantages=advantages,
+                rewards=rewards,
+            )
 
         fields_to_put = {adv_cfg.output_field: advantages}
         if seq_logprob_error_threshold is not None:

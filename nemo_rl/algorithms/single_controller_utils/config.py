@@ -423,6 +423,9 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     max_buffered_rollouts: PositiveInt = 64
     # Enable per-rollout diagnostic prints (prompt content / completion previews).
     diagnostics: bool = False
+    # Log bounded per-lag importance-sampling summaries and compact JSONL rows.
+    # May require a policy-logprob pass that would otherwise be skipped.
+    importance_sampling_diagnostics: bool = False
 
     @model_validator(mode="after")
     def _reject_renamed_blocks(self) -> "AsyncRLConfig":

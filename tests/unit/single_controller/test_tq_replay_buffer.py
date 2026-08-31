@@ -280,7 +280,10 @@ class TestTQReplayBufferReserveCommit:
         assert buf.end_weight_list == [4]
         assert buf.ready_list == [True]
         assert buf.meta_list[0].sample_ids == meta.sample_ids
-        # TQ tag uses start_weight_version (dispatch time).
+        # TQ tag uses start_weight_version (dispatch time); pass_rate is None
+        # because the stub record has no extra_env_info; staleness reflects
+        # end_weight - start_weight (4 - 3 = 1); rollout_metrics is absent
+        # because the stub record has an empty rollout_metrics dict.
         assert meta.tags == [
             {
                 "weight_version": 3,
@@ -288,6 +291,8 @@ class TestTQReplayBufferReserveCommit:
                 ROLLOUT_GENERATION_LENGTH_TAG: 1,
                 ROLLOUT_REWARD_TAG: 0.0,
                 ROLLOUT_TRUNCATED_TAG: False,
+                "pass_rate": None,
+                "staleness": 1,
             },
             {
                 "weight_version": 3,
@@ -295,6 +300,8 @@ class TestTQReplayBufferReserveCommit:
                 ROLLOUT_GENERATION_LENGTH_TAG: 2,
                 ROLLOUT_REWARD_TAG: 0.0,
                 ROLLOUT_TRUNCATED_TAG: True,
+                "pass_rate": None,
+                "staleness": 1,
             },
         ]
         assert len(dp.put_calls) == 1
