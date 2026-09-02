@@ -483,16 +483,16 @@ def reduce_advantage_pump_metrics(
         intended_pass_rates: Per-prompt dataset pass_rate values collected by
             _rollout_pump for every loader batch admitted since the last
             optimizer step. Reflects what the dataloader intended to feed;
-            compare against pass_rate/* (what the trainer actually consumed)
-            to spot sampler-driven difficulty skew.
+            compare against dataset_consumed_pass_rate/* (what the trainer
+            actually consumed) to spot sampler-driven difficulty skew.
 
     Returns:
         Step-level reward, advantage, token-count, optional sequence
         log-probability error metrics,
-        pass_rate/{mean,std,min,max,num_samples} when pass_rates is non-empty,
-        staleness/{mean,min,max} when stalenesses is non-empty, and
-        intended_pass_rate/{mean,min,max,num_prompts} when intended_pass_rates
-        is non-empty.
+        dataset_consumed_pass_rate/{mean,std,min,max,num_samples} when
+        pass_rates is non-empty, staleness/{mean,min,max} when stalenesses
+        is non-empty, and dataset_intended_pass_rate/{mean,min,max,num_prompts}
+        when intended_pass_rates is non-empty.
     """
     out: dict[str, float] = {}
     if rewards:
@@ -519,11 +519,11 @@ def reduce_advantage_pump_metrics(
         out.update(_reduce_seq_logprob_error_metrics(seq_logprob_error_metrics))
     if pass_rates:
         arr = np.asarray(pass_rates, dtype=np.float64)
-        out["pass_rate/mean"] = float(arr.mean())
-        out["pass_rate/std"] = float(arr.std())
-        out["pass_rate/min"] = float(arr.min())
-        out["pass_rate/max"] = float(arr.max())
-        out["pass_rate/num_samples"] = float(arr.size)
+        out["dataset_consumed_pass_rate/mean"] = float(arr.mean())
+        out["dataset_consumed_pass_rate/std"] = float(arr.std())
+        out["dataset_consumed_pass_rate/min"] = float(arr.min())
+        out["dataset_consumed_pass_rate/max"] = float(arr.max())
+        out["dataset_consumed_pass_rate/num_samples"] = float(arr.size)
     if stalenesses:
         arr = np.asarray(stalenesses, dtype=np.float64)
         out["staleness/mean"] = float(arr.mean())
@@ -531,10 +531,10 @@ def reduce_advantage_pump_metrics(
         out["staleness/max"] = float(arr.max())
     if intended_pass_rates:
         arr = np.asarray(intended_pass_rates, dtype=np.float64)
-        out["intended_pass_rate/mean"] = float(arr.mean())
-        out["intended_pass_rate/min"] = float(arr.min())
-        out["intended_pass_rate/max"] = float(arr.max())
-        out["intended_pass_rate/num_prompts"] = float(arr.size)
+        out["dataset_intended_pass_rate/mean"] = float(arr.mean())
+        out["dataset_intended_pass_rate/min"] = float(arr.min())
+        out["dataset_intended_pass_rate/max"] = float(arr.max())
+        out["dataset_intended_pass_rate/num_prompts"] = float(arr.size)
     return out
 
 

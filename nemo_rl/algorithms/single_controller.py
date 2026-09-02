@@ -39,6 +39,7 @@ import json
 import logging
 import math
 import os
+import statistics
 import time
 import uuid
 from collections import Counter, deque
@@ -331,6 +332,10 @@ class SingleControllerActor:
         # explainable after the fact. Kept separate from _step_log_dict
         # because the reducer expects numeric lists, not strings.
         self._step_dataset_sources: Counter[str] = Counter()
+        # Per-dataset-source pass_rate values for prompt groups consumed this
+        # step, read off the same tag as _step_dataset_sources so the two
+        # stay aligned. Reduced to a per-source mean at step close.
+        self._step_dataset_source_pass_rates: dict[str, list[float]] = {}
         self._dataset_composition_history: dict[int, dict[str, Any]] = {}
 
         print(
@@ -1421,6 +1426,11 @@ class SingleControllerActor:
                         ds = t.get("dataset_source")
                         if ds is not None:
                             self._step_dataset_sources[ds] += 1
+                            pass_rate = t.get("pass_rate")
+                            if pass_rate is not None:
+                                self._step_dataset_source_pass_rates.setdefault(
+                                    ds, []
+                                ).append(pass_rate)
 
                     # Remove consumed sample_ids from the buffer
                     await self._call_dp(
@@ -1476,6 +1486,9 @@ class SingleControllerActor:
                         seq_logprob_error_metrics=self._step_log_dict[
                             "seq_logprob_error_metrics"
                         ],
+                        pass_rates=self._step_log_dict["pass_rates"],
+                        stalenesses=self._step_log_dict["stalenesses"],
+                        intended_pass_rates=self._step_log_dict["intended_pass_rates"],
                     )
                 )
                 step_metrics.update(
@@ -1511,6 +1524,8 @@ class SingleControllerActor:
                 # uses -- so the JSON reads as {"0": {...}, "1": {...}, ...}.
                 # Percentages and raw counts are both recorded so a step that
                 # shrank under drop/replace stays explainable after the fact.
+                # mean_pass_rate is the dataset_consumed_pass_rate for that
+                # source's groups this step, keyed the same as counts/percentages.
                 if self._step_dataset_sources:
                     total = sum(self._step_dataset_sources.values())
                     self._dataset_composition_history[version_during_step] = {
@@ -1520,9 +1535,14 @@ class SingleControllerActor:
                             for k, v in self._step_dataset_sources.items()
                         },
                         "total_groups": total,
+                        "mean_pass_rate": {
+                            k: statistics.mean(v)
+                            for k, v in self._step_dataset_source_pass_rates.items()
+                        },
                     }
                     self._write_dataset_composition()
                     self._step_dataset_sources = Counter()
+                    self._step_dataset_source_pass_rates = {}
 
                 self._trainer_version += 1
                 self._train_steps += 1
