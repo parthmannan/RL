@@ -24,7 +24,7 @@ async_rl:
   # Enable per-rollout diagnostic prints (prompt content / completion previews).
   diagnostics: false
   # Log bounded per-lag importance-ratio summaries and compact JSONL rows.
-  # May add a policy-logprob pass when force_on_policy_ratio would otherwise skip it.
+  # Requires policy logprobs to already be enabled by the training configuration.
   importance_sampling_diagnostics: false
 
   # ── Resiliency ─────────────────────────────────────────────────────────────

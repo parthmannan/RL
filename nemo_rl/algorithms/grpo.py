@@ -2525,7 +2525,9 @@ def compute_and_apply_seq_logprob_error_masking(
     train_data: BatchedDataDict,
     rewards: torch.Tensor,
     seq_logprob_error_threshold: Optional[float],
-) -> dict:
+    *,
+    return_per_sequence_errors: bool = False,
+) -> dict | tuple[dict, torch.Tensor, torch.Tensor]:
     """Compute sequence-level logprob error metrics and optionally mask high-error sequences.
 
     This function computes the multiplicative probability error per sequence
@@ -2539,11 +2541,14 @@ def compute_and_apply_seq_logprob_error_masking(
         rewards: Reward tensor for computing statistics on masked sequences.
         seq_logprob_error_threshold: If set, mask sequences with mult_prob_error
                                     exceeding this threshold. If None, only compute metrics.
+        return_per_sequence_errors: Also return the already-computed per-sequence
+                                    error and validity tensors for diagnostics.
 
     Returns:
         Dict with keys: max_seq_mult_prob_error, mean_seq_mult_prob_error,
         min_seq_mult_prob_error, max/mean/min_seq_mult_prob_error_after_mask,
-        num_masked_seqs, masked_correct_pct
+        num_masked_seqs, masked_correct_pct. When requested, also returns the
+        per-sequence error values and their pre-mask validity mask.
     """
     # Compute sequence-level logprob error metrics (always)
     token_mask = train_data["token_mask"][:, 1:]
@@ -2639,7 +2644,7 @@ def compute_and_apply_seq_logprob_error_masking(
                 flush=True,
             )
 
-    return {
+    metrics = {
         "max_seq_mult_prob_error": max_seq_mult_prob_error,
         "mean_seq_mult_prob_error": mean_seq_mult_prob_error,
         "min_seq_mult_prob_error": min_seq_mult_prob_error,
@@ -2649,6 +2654,9 @@ def compute_and_apply_seq_logprob_error_masking(
         "num_masked_seqs": num_masked_seqs,
         "masked_correct_pct": masked_correct_pct,
     }
+    if return_per_sequence_errors:
+        return metrics, seq_mult_prob_error, valid_seq_mask
+    return metrics
 
 
 # ===============================================================================

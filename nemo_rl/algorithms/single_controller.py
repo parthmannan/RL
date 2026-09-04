@@ -137,9 +137,6 @@ class SingleControllerActor:
         self._async_cfg = master_config.async_rl
         self._importance_sampling_diagnostics = (
             ImportanceSamplingDiagnosticsAccumulator(
-                use_importance_sampling_correction=(
-                    master_config.loss_fn.use_importance_sampling_correction
-                ),
                 sequence_level_importance_ratios=(
                     master_config.loss_fn.sequence_level_importance_ratios
                 ),
@@ -156,12 +153,9 @@ class SingleControllerActor:
             if self._async_cfg.importance_sampling_diagnostics
             else None
         )
-        self._policy_logprobs_required = (
-            not (
-                master_config.loss_fn.force_on_policy_ratio
-                and master_config.grpo.seq_logprob_error_threshold is None
-            )
-            or self._importance_sampling_diagnostics is not None
+        self._policy_logprobs_required = not (
+            master_config.loss_fn.force_on_policy_ratio
+            and master_config.grpo.seq_logprob_error_threshold is None
         )
         self._reference_logprobs_required = not bool(
             master_config.grpo.skip_reference_policy_logprobs_calculation
@@ -2253,11 +2247,14 @@ class SingleControllerActor:
                 .sum()
                 .item()
             )
-            seq_error_metrics = compute_and_apply_seq_logprob_error_masking(
+            seq_error_result = compute_and_apply_seq_logprob_error_masking(
                 train_data=masking_data,
                 rewards=rewards,
                 seq_logprob_error_threshold=seq_logprob_error_threshold,
+                return_per_sequence_errors=True,
             )
+            assert isinstance(seq_error_result, tuple)
+            seq_error_metrics, seq_mult_prob_error, valid_seq_mask = seq_error_result
             sample_mask = masking_data["sample_mask"]
             num_valid_seqs_after = float(
                 ((token_mask[:, 1:] * sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
@@ -2320,6 +2317,7 @@ class SingleControllerActor:
                 step=self._train_steps + 1,
                 trainer_version=self._trainer_version,
                 sample_ids=list(meta.sample_ids),
+                rollout_tags=list(meta.tags),
                 rollout_weight_versions=[
                     int(tag["weight_version"]) for tag in meta.tags
                 ],
@@ -2332,6 +2330,8 @@ class SingleControllerActor:
                 sample_mask=sample_mask,
                 advantages=advantages,
                 rewards=rewards,
+                seq_mult_prob_error=seq_mult_prob_error,
+                valid_seq_mask=valid_seq_mask,
             )
 
         fields_to_put = {adv_cfg.output_field: advantages}

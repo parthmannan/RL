@@ -424,7 +424,7 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # Enable per-rollout diagnostic prints (prompt content / completion previews).
     diagnostics: bool = False
     # Log bounded per-lag importance-sampling summaries and compact JSONL rows.
-    # May require a policy-logprob pass that would otherwise be skipped.
+    # Uses policy logprobs already required by the training configuration.
     importance_sampling_diagnostics: bool = False
 
     @model_validator(mode="after")
@@ -752,6 +752,17 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         sampler_name=async_config.sampler.name,
     )
     validate_gym_actor_concurrency(master_config)
+
+    if (
+        async_config.importance_sampling_diagnostics
+        and master_config.loss_fn.force_on_policy_ratio
+        and master_config.grpo.seq_logprob_error_threshold is None
+    ):
+        raise ValueError(
+            "async_rl.importance_sampling_diagnostics requires policy logprobs "
+            "already enabled by the training configuration; set "
+            "grpo.seq_logprob_error_threshold or disable diagnostics"
+        )
 
     if (
         master_config.checkpointing.get("load_replay_buffer", True) is False
