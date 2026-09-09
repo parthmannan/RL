@@ -58,6 +58,8 @@ from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
+NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S = 120
+
 # Kept local so the Gym actor does not depend on model-config dtype resolution.
 # Must cover every name resolve_routed_experts_dtype can produce.
 _ROUTED_EXPERTS_DTYPES = {
@@ -1415,6 +1417,27 @@ def spinup_nemo_gym_actor(
         flush=True,
     )
     actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
-    ray.get(actor._spinup.remote())
-    ray.get(actor.set_tokenizer.remote(tokenizer))
+    try:
+        ray.get(actor._spinup.remote())
+        ray.get(actor.set_tokenizer.remote(tokenizer))
+    except Exception:
+        # _spinup can fail after RunHelper has started some Gym subprocesses.
+        # Ask the actor to reap anything it owns, then force-stop the actor as a
+        # final safety net. Cleanup errors must not hide the startup failure.
+        try:
+            ray.get(
+                actor.shutdown.remote(),
+                timeout=NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+            )
+        except Exception as cleanup_error:
+            print(
+                f"Warning: NeMo-Gym actor cleanup after startup failure failed: {cleanup_error}"
+            )
+        try:
+            ray.kill(actor)
+        except Exception as kill_error:
+            print(
+                f"Warning: NeMo-Gym actor kill after startup failure failed: {kill_error}"
+            )
+        raise
     return actor
