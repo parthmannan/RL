@@ -42,6 +42,11 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym_shards import (
+    SHARDING_CONFIG_KEYS,
+    ShardConfigError,
+    parse_shard_plan,
+)
 from nemo_rl.experience.failures import (
     GymTransportError,
     RolloutDataFailure,
@@ -52,6 +57,8 @@ from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
+
+NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S = 120
 
 # Kept local so the Gym actor does not depend on model-config dtype resolution.
 # Must cover every name resolve_routed_experts_dtype can produce.
@@ -485,7 +492,11 @@ def _attach_multimodal_data_to_user_message(
     )
 
 
-@ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
+# Fail fast rather than restart. The servers this actor owns are started in
+# _spinup, which Ray does not re-run after a restart, so a restarted actor is
+# permanently broken: _require_spinup() rejects every later rollout call, and
+# the caller never sees the RayActorError it is waiting for.
+@ray.remote(max_restarts=0, max_task_retries=0)  # pragma: no cover
 class NemoGym(EnvironmentInterface):
     """This environment class isn't really used for training. It's really meant as an integration wrapper around NeMo-Gym that hooks into the existing NeMo RL resource management via ray. So there is still one source of truth for resource management in NeMo RL."""
 
@@ -1029,13 +1040,16 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
         return result
 
     def shutdown(self) -> None:
-        # Teardown runs in a finally block, so it must not turn a real training error
-        # into a confusing AttributeError from a never-spun-up (e.g. restarted) actor.
-        if self.rh is None:
-            return
-        run_helper = self.rh
-        self.rh = None
-        run_helper.shutdown()
+        """Stop the Gym servers. Safe to call more than once, and before spinup.
+
+        Teardown runs in a finally block and may be requested more than once.
+        RunHelper.shutdown() is not idempotent, so the handle is cleared before
+        it is used. A failure therefore cannot leave a live handle that a later
+        cleanup attempt invokes again.
+        """
+        rh, self.rh = self.rh, None
+        if rh is not None:
+            rh.shutdown()
 
     def step(self, message_log_batch, metadata):
         # This is not used since NeMo-Gym will handle the rollouts entirely.
@@ -1301,11 +1315,34 @@ def spinup_nemo_gym_actor(
     """
     nemo_gym_dict = dict(env_configs["nemo_gym"])
 
+    # Validate the shards block even though only single-actor creation is wired
+    # up so far, so a malformed or premature sharded config fails at setup with
+    # a precise message instead of silently running unsharded.
+    shard_plan = parse_shard_plan(nemo_gym_dict)
+    if shard_plan is not None:
+        raise ShardConfigError(
+            f"env.nemo_gym.shards defines {len(shard_plan.shards)} shards "
+            f"({', '.join(s.name for s in shard_plan.shards)}), but multi-actor "
+            f"creation is not wired up yet. Remove 'shards' and use "
+            f"'config_paths' to run this job on a single actor."
+        )
+
+    # NeMo-RL-only keys are consumed here and must never reach Gym: the merged
+    # config is serialized into every Gym child process, and unrecognized
+    # dict-shaped top-level keys are parsed as server instance configs.
+    for key in SHARDING_CONFIG_KEYS:
+        nemo_gym_dict.pop(key, None)
+
     # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
     # (where the detector reads them), not part of Gym's global config.
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    port_range = {
+        key: value
+        for key in ("port_range_low", "port_range_high")
+        if (value := nemo_gym_dict.pop(key, None)) is not None
+    }
     # Same treatment for the multimodal knobs: NemoGymConfig declares them as
     # top-level fields, so populate them here instead of leaving the actor to
     # read them back out of Gym's global config dict.
@@ -1340,6 +1377,7 @@ def spinup_nemo_gym_actor(
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
         initial_global_config_dict=nemo_gym_dict,
+        **port_range,
         **multimodal_flags,
     )
 
@@ -1386,6 +1424,27 @@ def spinup_nemo_gym_actor(
         flush=True,
     )
     actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
-    ray.get(actor._spinup.remote())
-    ray.get(actor.set_tokenizer.remote(tokenizer))
+    try:
+        ray.get(actor._spinup.remote())
+        ray.get(actor.set_tokenizer.remote(tokenizer))
+    except Exception:
+        # _spinup can fail after RunHelper has started some Gym subprocesses.
+        # Ask the actor to reap anything it owns, then force-stop the actor as a
+        # final safety net. Cleanup errors must not hide the startup failure.
+        try:
+            ray.get(
+                actor.shutdown.remote(),
+                timeout=NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+            )
+        except Exception as cleanup_error:
+            print(
+                f"Warning: NeMo-Gym actor cleanup after startup failure failed: {cleanup_error}"
+            )
+        try:
+            ray.kill(actor)
+        except Exception as kill_error:
+            print(
+                f"Warning: NeMo-Gym actor kill after startup failure failed: {kill_error}"
+            )
+        raise
     return actor
