@@ -1741,6 +1741,10 @@ class TestSetup:
             enable_router_replay=False,
             use_fastokens=False,
             token_capture=None,
+            # Sizes every actor's Ray max_concurrency. Passed whole rather than
+            # divided by the replica count, because routing is by agent name
+            # and does not split evenly across a shard plan.
+            rollout_fan_in=mc.async_rl.max_inflight_prompts,
         )
         mock_validate.assert_called_once_with(
             fake_gym_shards,

@@ -57,7 +57,10 @@ from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
     ClusterConfig,
 )
-from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.environments.nemo_gym import (
+    should_use_nemo_gym,
+    validate_nemo_gym_actor_concurrency,
+)
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
@@ -1286,6 +1289,46 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
 
+def validate_gym_actor_concurrency(master_config: MasterConfig) -> None:
+    """Validate the NeMo-Gym actors can admit the configured rollout fan-in.
+
+    The rollout pump dispatches one ``run_rollouts`` call per in-flight prompt
+    onto a NemoGym actor, so ``env.nemo_gym.max_concurrency`` — when set
+    explicitly — has to cover ``async_rl.max_inflight_prompts`` plus the
+    actor's control-plane headroom. Checked here so the pair fails at config
+    load instead of stalling a run that has already claimed its allocation.
+
+    The fan-in is NOT divided by a shard plan's replica count. Routing is by
+    agent name, so it does not split evenly — a verifier shard spreads its
+    entries over its replicas while a judge shard is typically one
+    un-replicated actor — and any even division would under-provision
+    whichever shard runs hot.
+
+    Three configs skip: one assembled through model_construct can lack ``env``
+    entirely (see the note in validate_single_controller_config), one not
+    taking the Gym rollout path never builds the actor, and one without a Gym
+    section is not on this path at all.
+
+    Args:
+        master_config: The SingleController master config being validated.
+    """
+    env_config = getattr(master_config, "env", None)
+    if env_config is None:
+        return
+    # Mirrors the rollout_failure check in validate_single_controller_config:
+    # should_use_nemo_gym decides which settings are inert, and an inert knob is
+    # not worth failing a run over.
+    if not env_config.get("should_use_nemo_gym"):
+        return
+    nemo_gym_config = env_config.get("nemo_gym")
+    if nemo_gym_config is None:
+        return
+    validate_nemo_gym_actor_concurrency(
+        nemo_gym_config.get("max_concurrency"),
+        rollout_fan_in=master_config.async_rl.max_inflight_prompts,
+    )
+
+
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
     _validate_algo_settings(master_config)
@@ -1332,6 +1375,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         required_capacity=required_capacity,
         sampler_name=async_config.sampler.name,
     )
+    validate_gym_actor_concurrency(master_config)
 
     if isinstance(async_config.sampler, ReadyFirstSamplerConfig):
         if not master_config.loss_fn.use_importance_sampling_correction:

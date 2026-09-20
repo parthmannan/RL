@@ -762,6 +762,17 @@ def _spinup_gym(
             if master_config.token_capture.enabled
             else None
         ),
+        # The rollout pump dispatches one generate_and_push per in-flight
+        # prompt and each is exactly one run_rollouts call on a Gym actor, so
+        # the in-flight cap is the fan-in the actors have to admit.
+        #
+        # Passed WHOLE rather than divided by the replica count, which is the
+        # part worth knowing under a shard plan: routing is by agent name, so
+        # the fan-in does not split evenly -- the verifier shard spreads its
+        # entries over its replicas while the judge shard is a single
+        # un-replicated actor -- and an even division would under-provision
+        # whichever shard runs hot.
+        rollout_fan_in=master_config.async_rl.max_inflight_prompts,
     )
     return shard_set, time.perf_counter() - t0
 

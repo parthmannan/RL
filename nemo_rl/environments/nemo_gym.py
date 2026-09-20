@@ -135,6 +135,18 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
 
+# Ray's max_concurrency default for async actors. Recorded here because it is
+# the number that decides whether a rollout fan-in gets admitted or silently
+# queued at the raylet, and because it is not visible anywhere in this repo
+# unless the option is passed explicitly (which the actor builders now always
+# do).
+RAY_DEFAULT_ASYNC_ACTOR_MAX_CONCURRENCY = 1000
+
+# Concurrency slots reserved on top of the rollout fan-in for the actor's
+# non-rollout methods (_spinup, shutdown), so a saturated rollout queue cannot
+# lock the actor's control plane out.
+NEMO_GYM_CONTROL_CONCURRENCY_HEADROOM = 8
+
 
 def _require_resolved_agent_refs(nemo_gym_examples: list[dict]) -> None:
     """Fail readably when Gym did not stamp an agent_ref onto every row.
@@ -1420,6 +1432,156 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         env_cfg.setdefault("tokenizer_config", dict(config.policy["tokenizer"]))
 
 
+def validate_nemo_gym_actor_concurrency(
+    configured_max_concurrency: Optional[int],
+    *,
+    rollout_fan_in: Optional[int],
+) -> None:
+    """Validate that the Gym actor can admit the caller's rollout fan-in.
+
+    A no-op in two cases. When ``env.nemo_gym.max_concurrency`` is unset,
+    resolve_nemo_gym_max_concurrency derives a value that admits the fan-in by
+    construction. When the caller has no fan-in to declare (``rollout_fan_in``
+    is None) there is no floor to hold an explicit value to, so it is honoured
+    as typed.
+
+    Call this from config validation on any path that does declare a fan-in, so
+    an explicit value that is too small fails before any cluster is built rather
+    than presenting as a stalled run hours later; on the SingleController path
+    validate_gym_actor_concurrency does exactly that.
+
+    Under a shard plan the fan-in is held against EVERY actor rather than
+    divided by the replica count -- see resolve_nemo_gym_max_concurrency.
+
+    Args:
+        configured_max_concurrency: ``env.nemo_gym.max_concurrency``, or None when
+            the user did not set it.
+        rollout_fan_in: Most concurrent ``run_rollouts`` calls the caller can have
+            outstanding against the actor, or None on a path that does not size the
+            actor from a config knob (see spinup_nemo_gym_actor).
+
+    Raises:
+        ValueError: rollout_fan_in is not positive, or the configured value cannot
+            admit the fan-in plus the actor's control-plane headroom.
+    """
+    if rollout_fan_in is None:
+        return
+    if rollout_fan_in <= 0:
+        raise ValueError(f"rollout_fan_in must be positive, got {rollout_fan_in}")
+    if configured_max_concurrency is None:
+        return
+    required = rollout_fan_in + NEMO_GYM_CONTROL_CONCURRENCY_HEADROOM
+    if configured_max_concurrency < required:
+        raise ValueError(
+            f"env.nemo_gym.max_concurrency ({configured_max_concurrency}) is below "
+            f"the rollout fan-in ({rollout_fan_in}) the caller can dispatch plus the "
+            f"control-plane headroom ({NEMO_GYM_CONTROL_CONCURRENCY_HEADROOM}) the "
+            f"actor needs. Ray admits only max_concurrency tasks into an async actor "
+            f"at a time and parks the rest inside the actor process, where no NeMo-RL "
+            f"backpressure valve can see them (Ray records them as "
+            f"PENDING_ACTOR_TASK_ORDERING_OR_CONCURRENCY), so the surplus rollouts "
+            f"would never start -- and with no headroom left the actor's own "
+            f"health_check and shutdown are not admitted either, which surfaces as an "
+            f"unhealthy environment. Raise env.nemo_gym.max_concurrency to at least "
+            f"{required}, lower the caller's rollout fan-in "
+            f"(async_rl.max_inflight_prompts on the SingleController path), or unset "
+            f"env.nemo_gym.max_concurrency to have it derived from the fan-in."
+        )
+
+
+def resolve_nemo_gym_max_concurrency(
+    configured_max_concurrency: Optional[int],
+    *,
+    rollout_fan_in: Optional[int],
+) -> Optional[int]:
+    """Return the Ray ``max_concurrency`` to create the NemoGym actor with.
+
+    Ray admits at most ``max_concurrency`` tasks into an async actor at a time
+    and parks the rest inside the actor process, as fibers blocked on its
+    concurrency semaphore; the submitting worker logs
+    ``>N tasks pending submission to actor NemoGym`` and nothing else, and Ray
+    records them as PENDING_ACTOR_TASK_ORDERING_OR_CONCURRENCY. Its default for
+    async actors is ``RAY_DEFAULT_ASYNC_ACTOR_MAX_CONCURRENCY``, and a run that
+    keeps more rollouts in flight than that produces no rollout groups and no
+    training steps at all.
+
+    Every in-flight prompt is exactly one ``run_rollouts`` streaming call that
+    holds its concurrency slot until that prompt's whole group is done, so the
+    actor has to admit ``rollout_fan_in`` of them. The derived default is that
+    plus ``NEMO_GYM_CONTROL_CONCURRENCY_HEADROOM`` for the actor's non-rollout
+    methods, and deliberately nothing more: the caller's own in-flight cap is
+    the backpressure valve, and a much larger value would only admit more
+    rollouts into the actor at once -- more live rollout state to hold and more
+    coroutines contending for its single event loop -- without making the
+    surplus any more visible to NeMo-RL than before.
+
+    UNDER A SHARD PLAN THE CALLER PASSES THE WHOLE FAN-IN, NOT ITS SHARE. Each
+    replica is sized to admit all of it. Rollouts route by agent name, so the
+    fan-in does not split evenly -- a verifier shard spreads its entries over
+    its replicas while a judge shard is typically one un-replicated actor -- and
+    dividing by the replica count would under-provision whichever shard runs
+    hot. The reasoning above applies unchanged: this only widens a semaphore,
+    and the caller's in-flight cap still bounds the true total across all
+    actors, so per-actor over-provisioning costs nothing it did not already.
+
+    The headroom is a floor on the actor's non-rollout capacity, not a hard
+    bound: a ``run_rollouts`` generator the caller stops consuming keeps its slot
+    until the task finishes, because Ray runs a generator task to completion
+    regardless of the caller and nothing on this path calls ``ray.cancel``. The
+    driver-side protocol guards in RolloutManager._stream_rows exit the loop that
+    way, so a prompt can transiently hold more than one slot.
+
+    Args:
+        configured_max_concurrency: ``env.nemo_gym.max_concurrency``, or None when
+            the user did not set it.
+        rollout_fan_in: Most concurrent ``run_rollouts`` calls the caller can have
+            outstanding against the actor, or None on a path that does not size the
+            actor from a config knob, which leaves Ray's default in place.
+
+    Returns:
+        Value to pass as the actor's ``max_concurrency`` option, or None to omit
+        the option and leave Ray's default applied.
+
+    Raises:
+        ValueError: rollout_fan_in is not positive, or the configured value cannot
+            admit it.
+    """
+    validate_nemo_gym_actor_concurrency(
+        configured_max_concurrency,
+        rollout_fan_in=rollout_fan_in,
+    )
+    if configured_max_concurrency is not None:
+        return configured_max_concurrency
+    if rollout_fan_in is None:
+        return None
+    return rollout_fan_in + NEMO_GYM_CONTROL_CONCURRENCY_HEADROOM
+
+
+def _log_actor_concurrency(max_concurrency: Optional[int], *, shard_count: int) -> None:
+    """Print the concurrency every Gym actor was created with.
+
+    Logged because a fan-in that exceeds it is what a rollout stall looks like
+    -- the surplus parks inside the actor process, where none of this repo's
+    backpressure valves can see it -- and the actor's concurrency is otherwise
+    invisible once the run is up.
+    """
+    if max_concurrency is None:
+        resolved = (
+            f"unset, so Ray's async-actor default of "
+            f"{RAY_DEFAULT_ASYNC_ACTOR_MAX_CONCURRENCY} applies"
+        )
+    else:
+        resolved = (
+            f"{max_concurrency} (Ray's async-actor default is "
+            f"{RAY_DEFAULT_ASYNC_ACTOR_MAX_CONCURRENCY})"
+        )
+    print(
+        f"build_nemo_gym_actors: max_concurrency={resolved} "
+        f"on each of {shard_count} actor(s)",
+        flush=True,
+    )
+
+
 def build_nemo_gym_config(
     env_configs: dict[str, Any],
     *,
@@ -1743,6 +1905,7 @@ def build_nemo_gym_actors(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]] = None,
+    rollout_fan_in: Optional[int] = None,
     pg_ready_timeout: float = DEFAULT_SHARD_PG_READY_TIMEOUT_SECONDS,
     spinup_timeout: float = DEFAULT_SHARD_SPINUP_TIMEOUT_SECONDS,
 ) -> NemoGymShardSet:
@@ -1757,6 +1920,15 @@ def build_nemo_gym_actors(
     Args:
         tokenizer: Installed on every actor once it is up, rather than passed
             per rollout call. See ``NemoGym.set_tokenizer`` for why.
+        rollout_fan_in: Most concurrent ``run_rollouts`` calls the caller can
+            have outstanding, which sizes each actor's Ray ``max_concurrency``
+            (see resolve_nemo_gym_max_concurrency). Applied WHOLE to every
+            replica rather than divided by the replica count, because routing
+            is by agent name and does not split evenly. None leaves the option
+            off and Ray's default of
+            ``RAY_DEFAULT_ASYNC_ACTOR_MAX_CONCURRENCY`` applied -- which is the
+            pre-existing behaviour, and a silent ceiling on any run whose
+            in-flight budget exceeds it.
 
     Returns:
         A :class:`NemoGymShardSet` whose actors are all running and validated.
@@ -1767,6 +1939,12 @@ def build_nemo_gym_actors(
             actors already created are torn down first.
     """
     nemo_gym_dict = dict(env_configs["nemo_gym"])
+    # A Ray actor option, not a Gym setting, so it is popped before the plan is
+    # parsed and must not reach Gym's global config parser.
+    max_concurrency = resolve_nemo_gym_max_concurrency(
+        nemo_gym_dict.pop("max_concurrency", None),
+        rollout_fan_in=rollout_fan_in,
+    )
     plan = parse_shard_plan(nemo_gym_dict)
 
     if plan is None:
@@ -1778,6 +1956,7 @@ def build_nemo_gym_actors(
             enable_router_replay=enable_router_replay,
             use_fastokens=use_fastokens,
             token_capture=token_capture,
+            max_concurrency=max_concurrency,
         )
 
     return _build_sharded_gym_actors(
@@ -1789,6 +1968,7 @@ def build_nemo_gym_actors(
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
         token_capture=token_capture,
+        max_concurrency=max_concurrency,
         pg_ready_timeout=pg_ready_timeout,
         spinup_timeout=spinup_timeout,
     )
@@ -1803,6 +1983,7 @@ def _build_single_gym_actor(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]],
+    max_concurrency: Optional[int] = None,
 ) -> NemoGymShardSet:
     """The pre-sharding path: one actor, no placement group, no discovery.
 
@@ -1821,12 +2002,15 @@ def _build_single_gym_actor(
     actor_options: dict[str, Any] = {
         "runtime_env": make_actor_runtime_env(NEMO_GYM_ACTOR_FQN)
     }
+    if max_concurrency is not None:
+        actor_options["max_concurrency"] = max_concurrency
     if nemo_gym_dict.get("num_gpu_nodes", 0):
         actor_options["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
             node_id=ray.get_runtime_context().get_node_id(),
             soft=True,
         )
 
+    _log_actor_concurrency(max_concurrency, shard_count=1)
     actor = NemoGym.options(**actor_options).remote(actor_config)
     shard_set = NemoGymShardSet(handles={DEFAULT_SHARD_NAME: [actor]})
     try:
@@ -1851,6 +2035,7 @@ def _build_sharded_gym_actors(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]],
+    max_concurrency: Optional[int] = None,
     pg_ready_timeout: float,
     spinup_timeout: float,
 ) -> NemoGymShardSet:
@@ -1912,6 +2097,7 @@ def _build_sharded_gym_actors(
             f"allocation may be too small or its nodes too busy."
         ) from error
 
+    _log_actor_concurrency(max_concurrency, shard_count=len(instances))
     shard_set = NemoGymShardSet(handles={}, placement_group=pg)
     try:
         for bundle_index, (shard, replica) in enumerate(instances):
@@ -1920,13 +2106,20 @@ def _build_sharded_gym_actors(
                 shard.name,
                 replica_index=replica if shard.replicas > 1 else None,
             )
-            actor = NemoGym.options(
-                runtime_env=actor_runtime_env,
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
+            replica_options: dict[str, Any] = {
+                "runtime_env": actor_runtime_env,
+                "scheduling_strategy": PlacementGroupSchedulingStrategy(
                     placement_group=pg,
                     placement_group_bundle_index=bundle_index,
                 ),
-            ).remote(
+            }
+            # Every replica is sized for the WHOLE fan-in. See
+            # resolve_nemo_gym_max_concurrency: routing is by agent name and
+            # does not split evenly across replicas, so dividing here would
+            # under-provision whichever shard runs hot.
+            if max_concurrency is not None:
+                replica_options["max_concurrency"] = max_concurrency
+            actor = NemoGym.options(**replica_options).remote(
                 _build_gym_actor_config(
                     instance_gym_dict,
                     base_urls=base_urls,

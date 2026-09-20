@@ -1283,3 +1283,118 @@ def test_shard_set_shutdown_releases_the_placement_group_once():
     assert kill.call_count == 4
     # Releasing a group twice raises; the second shutdown must not try.
     remove.assert_called_once_with(pg)
+
+
+def test_resolve_max_concurrency_derives_fan_in_plus_headroom():
+    """Unset means derive, not "leave Ray's default"."""
+    resolved = nemo_gym_mod.resolve_nemo_gym_max_concurrency(None, rollout_fan_in=8704)
+
+    assert resolved == 8704 + nemo_gym_mod.NEMO_GYM_CONTROL_CONCURRENCY_HEADROOM
+    # The headroom exists so a saturated rollout queue cannot lock out the
+    # actor's own _spinup/shutdown, so it has to be strictly above the fan-in.
+    assert resolved > 8704
+
+
+def test_resolve_max_concurrency_leaves_the_option_off_without_a_fan_in():
+    """The v1 path declares no fan-in and must keep Ray's default untouched."""
+    assert (
+        nemo_gym_mod.resolve_nemo_gym_max_concurrency(None, rollout_fan_in=None) is None
+    )
+
+
+def test_resolve_max_concurrency_honours_an_explicit_value():
+    assert (
+        nemo_gym_mod.resolve_nemo_gym_max_concurrency(50_000, rollout_fan_in=8704)
+        == 50_000
+    )
+
+
+def test_resolve_max_concurrency_rejects_an_explicit_value_below_the_fan_in():
+    """An explicit value that cannot admit the fan-in is the silent-hang case."""
+    with pytest.raises(ValueError, match="is below the rollout fan-in"):
+        nemo_gym_mod.resolve_nemo_gym_max_concurrency(1000, rollout_fan_in=34_816)
+
+
+def test_resolve_max_concurrency_rejects_a_non_positive_fan_in():
+    with pytest.raises(ValueError, match="rollout_fan_in must be positive"):
+        nemo_gym_mod.resolve_nemo_gym_max_concurrency(None, rollout_fan_in=0)
+
+
+def test_build_nemo_gym_actors_sizes_every_replica_for_the_whole_fan_in(
+    detected_uv_dirs,
+):
+    """Each replica admits the FULL fan-in, not its even share of it.
+
+    Routing is by agent name, so the fan-in does not split evenly across
+    replicas -- an un-replicated judge shard and a 32-replica verifier shard
+    see very different shares. Dividing by the replica count would
+    under-provision whichever shard runs hot, and the overflow does not raise:
+    it parks inside the actor as fibers on its concurrency semaphore.
+    """
+    cluster = _FakeGymCluster(
+        entries_by_index={
+            0: {"math_agent": ["responses_api_agents"]},
+            1: {"bash_agent": ["responses_api_agents"]},
+        }
+    )
+
+    with _patched_cluster(cluster):
+        nemo_gym_mod.build_nemo_gym_actors(
+            _shard_env_configs(),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            rollout_fan_in=17_408,
+        )
+
+    expected = 17_408 + nemo_gym_mod.NEMO_GYM_CONTROL_CONCURRENCY_HEADROOM
+    assert len(cluster.actor_options) == 3
+    assert [options["max_concurrency"] for options in cluster.actor_options] == [
+        expected
+    ] * 3
+    # The whole point: comfortably above Ray's default, which is the ceiling
+    # this wiring exists to remove.
+    assert expected > nemo_gym_mod.RAY_DEFAULT_ASYNC_ACTOR_MAX_CONCURRENCY
+
+
+def test_build_nemo_gym_actors_omits_max_concurrency_without_a_fan_in(
+    detected_uv_dirs,
+):
+    """No fan-in declared leaves the actors exactly as they were built before."""
+    cluster = _FakeGymCluster()
+
+    with _patched_cluster(cluster):
+        nemo_gym_mod.build_nemo_gym_actors(
+            _env_configs(),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+        )
+
+    assert "max_concurrency" not in cluster.actor_options[0]
+
+
+def test_build_nemo_gym_actors_keeps_max_concurrency_out_of_the_gym_config(
+    detected_uv_dirs,
+):
+    """It is a Ray actor option; Gym's global config parser must never see it."""
+    cluster = _FakeGymCluster()
+
+    with _patched_cluster(cluster):
+        nemo_gym_mod.build_nemo_gym_actors(
+            _env_configs(max_concurrency=4096),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            rollout_fan_in=64,
+        )
+
+    assert cluster.actor_options[0]["max_concurrency"] == 4096
+    (actor_config,) = cluster.actor_configs
+    assert "max_concurrency" not in actor_config["initial_global_config_dict"]
