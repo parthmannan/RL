@@ -36,6 +36,9 @@ async_rl:
   max_buffered_rollouts: 64
   # Enable per-rollout diagnostic prints (prompt content / completion previews).
   diagnostics: false
+  # Log bounded per-lag importance-ratio summaries and compact JSONL rows.
+  # Requires policy logprobs to already be enabled by the training configuration.
+  importance_sampling_diagnostics: false
 
   # ── Resiliency ─────────────────────────────────────────────────────────────
   # What happens to a prompt whose rollout fails. Infrastructure failures are

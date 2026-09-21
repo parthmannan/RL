@@ -687,12 +687,58 @@ class TestTQReplayBufferReserveCommit:
         assert buf.end_weight_list == [4]
         assert buf.ready_list == [True]
         assert buf.meta_list[0].sample_ids == meta.sample_ids
-        # TQ tags preserve both dispatch-time weight and dataset identity.
-        assert meta.tags == [{"weight_version": 3, "prompt_idx": 418}] * _N_GENS
+        # TQ tags preserve both dispatch-time weight and dataset identity, plus
+        # the rollout diagnostics stamped alongside them: staleness is
+        # end_weight - start_weight (4 - 3 = 1), and the environment falls back
+        # to "unknown" because the stub record carries neither an agent_ref nor
+        # a task_name. dataset_source / pass_rate are absent -- the stub record
+        # has no extra_env_info.
+        assert meta.tags == [
+            {
+                "weight_version": 3,
+                "prompt_idx": 418,
+                "rollout_environment": "unknown",
+                "staleness": 1,
+            }
+        ] * _N_GENS
         assert len(dp.put_calls) == 1
         assert len(trace_calls) == 1
         assert trace_calls[0]["keys"] == meta.sample_ids
         assert trace_calls[0]["data"]["input_lengths"].tolist() == [3, 3]
+
+    def test_commit_stamps_group_scoped_blend_tags(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        record = _make_record()
+        record.extra_env_info = {
+            "agent_ref": {"name": "instruction_following_simple_agent"},
+            "dataset": "ifbench",
+            "pass_rate": 0.25,
+        }
+
+        group_id = buf.reserve(weight_version=7)
+        meta = _run(
+            buf.commit(
+                group_id,
+                record,
+                start_weight_version=7,
+                end_weight_version=9,
+            )
+        )
+
+        assert meta.tags is not None
+        # Environment and staleness are per row: every generation of the group
+        # was produced by the same agent under the same weight drift.
+        assert [t["rollout_environment"] for t in meta.tags] == [
+            "instruction_following_simple_agent"
+        ] * _N_GENS
+        assert [t["staleness"] for t in meta.tags] == [2] * _N_GENS
+        # Blend composition is a prompt-group property, so dataset_source and
+        # pass_rate ride the first row only -- one contribution per group.
+        assert meta.tags[0]["dataset_source"] == "ifbench"
+        assert meta.tags[0]["pass_rate"] == 0.25
+        assert all("dataset_source" not in t for t in meta.tags[1:])
+        assert all("pass_rate" not in t for t in meta.tags[1:])
 
     def test_commit_requires_routed_experts_before_tq_write(self):
         dp = FakeDataPlaneClient()

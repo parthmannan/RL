@@ -49,6 +49,31 @@ VIOLATION_TAG_KEYS = (
 _VIOLATION_COUNTS_KEY = "violation_counts"
 
 
+def record_environment(record: PromptGroupRecord) -> str:
+    """Name the environment a prompt group was rolled out against.
+
+    NeMo-Gym identifies an environment through ``agent_ref.name``. Native
+    environments do not carry an agent reference, so their task name is the
+    stable fallback.
+
+    Args:
+        record: Completed prompt group to name.
+
+    Returns:
+        The environment name, or ``"unknown"`` when neither source is usable.
+    """
+    if isinstance(record.extra_env_info, dict):
+        agent_ref = record.extra_env_info.get("agent_ref")
+        if isinstance(agent_ref, dict):
+            agent_name = agent_ref.get("name")
+            if isinstance(agent_name, str) and agent_name.strip():
+                return agent_name.strip()
+    task_name = record.metadata.get("task_name")
+    if isinstance(task_name, str) and task_name.strip():
+        return task_name.strip()
+    return "unknown"
+
+
 def _violation_counts(
     message_log: LLMMessageLogType | VLMMessageLogType,
 ) -> dict[str, int]:

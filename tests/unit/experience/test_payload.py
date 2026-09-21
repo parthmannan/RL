@@ -23,7 +23,11 @@ from nemo_rl.data_plane.schema import (
     MALFORMED_THINKING_MASK,
 )
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
-from nemo_rl.experience.payload import pack_payload, record_to_train_batch
+from nemo_rl.experience.payload import (
+    pack_payload,
+    record_environment,
+    record_to_train_batch,
+)
 
 
 def _routes(start: int, count: int) -> torch.Tensor:
@@ -474,3 +478,38 @@ def test_pack_payload_stamps_violation_counts_on_tags() -> None:
             "num_routed_experts_backfilled": 1,
         },
     ]
+
+
+def _record_for_environment(
+    extra_env_info: dict | None, metadata: dict
+) -> PromptGroupRecord:
+    return PromptGroupRecord(
+        prompt_idx=0,
+        prompt=[],
+        extra_env_info=extra_env_info,
+        metadata=metadata,
+        completions=[],
+        rollout_metrics={},
+    )
+
+
+class TestRecordEnvironment:
+    def test_prefers_nemo_gym_agent_name(self) -> None:
+        record = _record_for_environment(
+            {"agent_ref": {"name": "  ifbench_agent  "}},
+            {"task_name": "math"},
+        )
+        assert record_environment(record) == "ifbench_agent"
+
+    def test_falls_back_to_task_name(self) -> None:
+        record = _record_for_environment(None, {"task_name": "math"})
+        assert record_environment(record) == "math"
+
+    def test_blank_agent_name_falls_through(self) -> None:
+        record = _record_for_environment(
+            {"agent_ref": {"name": "   "}}, {"task_name": "math"}
+        )
+        assert record_environment(record) == "math"
+
+    def test_unknown_when_neither_source_is_usable(self) -> None:
+        assert record_environment(_record_for_environment(None, {})) == "unknown"

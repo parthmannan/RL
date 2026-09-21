@@ -52,12 +52,20 @@ from nemo_rl.data_plane.schema import (
     ROUTED_EXPERTS_FIELD,
 )
 from nemo_rl.experience.interfaces import (
+    DATASET_SOURCE_TAG,
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
+    PASS_RATE_TAG,
     RETAINED_TASK_INDICES_KEY,
+    ROLLOUT_ENVIRONMENT_TAG,
+    STALENESS_TAG,
     PromptGroupRecord,
 )
-from nemo_rl.experience.payload import pack_payload, record_to_train_batch
+from nemo_rl.experience.payload import (
+    pack_payload,
+    record_environment,
+    record_to_train_batch,
+)
 from nemo_rl.utils.r3_trace import trace_rollout_payload
 
 DATA_PLANE_CHECKPOINT_DIR = "data_plane"
@@ -1252,6 +1260,32 @@ class TQReplayBuffer:
             group_id=group_id,
             prompt_idx=record.prompt_idx,
         )
+        # Per-row rollout diagnostics. staleness is the weight-version gap
+        # between rollout start and commit -- a proxy for how many weight
+        # updates landed while this rollout was in flight. It is one value for
+        # the whole group, so a trainer-side mean over rows equals the mean
+        # over groups.
+        environment = record_environment(record)
+        staleness = int(end_weight_version) - int(start_weight_version)
+        for tag in tags:
+            tag[ROLLOUT_ENVIRONMENT_TAG] = environment
+            tag[STALENESS_TAG] = staleness
+
+        # Blend composition is a per-prompt-group property (all N generations
+        # of a group share one dataset row), so dataset_source and pass_rate
+        # ride the group's first row only. One tag per group keeps the payload
+        # small and gives the trainer a natural per-group dedup key --
+        # percentages then track prompt-group share of the batch rather than
+        # row share. Co-locating the two on the same tag is what lets the
+        # composition dump report a per-source mean pass_rate.
+        if isinstance(record.extra_env_info, dict):
+            dataset_source = record.extra_env_info.get("dataset")
+            if dataset_source is not None:
+                tags[0][DATASET_SOURCE_TAG] = str(dataset_source)
+            pass_rate = record.extra_env_info.get("pass_rate")
+            if pass_rate is not None:
+                tags[0][PASS_RATE_TAG] = float(pass_rate)
+
         if self._require_routed_experts and ROUTED_EXPERTS_FIELD not in fields:
             raise RuntimeError(
                 "policy.router_replay.enabled=true requires routed_experts in "

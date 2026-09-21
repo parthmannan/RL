@@ -23,6 +23,7 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.algorithms.single_controller_utils.utils import (
+    ImportanceSamplingDiagnosticsAccumulator,
     aggregate_step_metrics,
     apply_message_level_advantage_penalties,
     fields_for_put,
@@ -147,6 +148,25 @@ class TestReduceAdvantagePumpMetrics:
         assert out["advantages/min"] == pytest.approx(-1.0)
         assert out["total_num_tokens"] == pytest.approx(10.0)
         assert out["num_mask_sample_filtered"] == pytest.approx(3.0)
+
+    def test_staleness_reduces_to_mean_min_max(self) -> None:
+        out = reduce_advantage_pump_metrics(
+            rewards=[],
+            masked_advantages=[],
+            sequence_lengths=[],
+            stalenesses=[0, 1, 1, 2],
+        )
+        assert out["staleness/mean"] == pytest.approx(1.0)
+        assert out["staleness/min"] == pytest.approx(0.0)
+        assert out["staleness/max"] == pytest.approx(2.0)
+
+    def test_staleness_omitted_when_absent(self) -> None:
+        out = reduce_advantage_pump_metrics(
+            rewards=[],
+            masked_advantages=[],
+            sequence_lengths=[],
+        )
+        assert not any(key.startswith("staleness/") for key in out)
 
     def test_empty_advantages_tensor_yields_zeros(self) -> None:
         out = reduce_advantage_pump_metrics(
@@ -328,3 +348,147 @@ class TestFieldsForPut:
         out = fields_for_put(meta, {"scalar": value})
         assert not out["scalar"].is_nested
         assert out["scalar"].shape == (2, 1)
+
+
+def _is_accumulator() -> ImportanceSamplingDiagnosticsAccumulator:
+    return ImportanceSamplingDiagnosticsAccumulator(
+        sequence_level_importance_ratios=False,
+        truncated_importance_sampling_ratio=2.0,
+        truncated_importance_sampling_ratio_min=0.5,
+        truncated_importance_sampling_type=None,
+    )
+
+
+def _record_batch(
+    acc: ImportanceSamplingDiagnosticsAccumulator,
+    *,
+    environments: list[str],
+    weight_versions: list[int],
+    trainer_version: int = 5,
+    errors: list[float] | None = None,
+    sample_mask: list[float] | None = None,
+) -> None:
+    size = len(environments)
+    seq_error = torch.tensor(errors or [1.2] * size)
+    acc.record(
+        step=1,
+        trainer_version=trainer_version,
+        sample_ids=[f"grp{i}_g0" for i in range(size)],
+        rollout_tags=[{"rollout_environment": env} for env in environments],
+        rollout_weight_versions=weight_versions,
+        sequence_lengths=[8] * size,
+        prev_logprobs=torch.zeros(size, 4),
+        generation_logprobs=torch.zeros(size, 4),
+        token_mask=torch.ones(size, 4),
+        sample_mask=torch.tensor(sample_mask or [1.0] * size),
+        advantages=torch.zeros(size, 4),
+        rewards=torch.ones(size),
+        seq_mult_prob_error=seq_error,
+        valid_seq_mask=torch.ones(size, dtype=torch.bool),
+    )
+
+
+class TestImportanceSamplingDiagnosticsAccumulator:
+    def test_empty_flush_yields_nothing(self) -> None:
+        assert _is_accumulator().flush() == ({}, [])
+
+    def test_splits_ifbench_cohort_and_buckets_by_lag(self) -> None:
+        acc = _is_accumulator()
+        # Two lags (5-5=0 and 5-4=1); within lag 0, one ifbench row and one not.
+        _record_batch(
+            acc,
+            environments=[
+                "instruction_following_simple_agent",
+                "math",
+                "math",
+            ],
+            weight_versions=[5, 5, 4],
+            errors=[1.4, 1.05, 1.3],
+        )
+        metrics, rows = acc.flush()
+
+        assert metrics["importance_sampling/lag_0/num_sequences"] == 2.0
+        assert metrics["importance_sampling/lag_1/num_sequences"] == 1.0
+        # Only the ifbench row lands in the lag-0 ifbench cohort.
+        assert metrics["importance_sampling/lag_0/ifbench_direct/num_sequences"] == 1.0
+        assert metrics["importance_sampling/lag_0/ifbench_direct/retained_ei_mean"] == (
+            pytest.approx(1.4)
+        )
+        assert metrics["importance_sampling/lag_1/ifbench_direct/num_sequences"] == 0.0
+        assert metrics["importance_sampling/lag_0/retained_ei_mean"] == pytest.approx(
+            (1.4 + 1.05) / 2
+        )
+        # One lag_summary per lag, plus the retained high-error rows.
+        summaries = [r for r in rows if r["record_type"] == "lag_summary"]
+        assert [s["observed_lag"] for s in summaries] == [0, 1]
+        assert summaries[0]["all"]["num_sequences"] == 2
+        assert summaries[0]["ifbench_direct"]["num_sequences"] == 1
+        assert summaries[0]["other"]["num_sequences"] == 1
+        high = [r for r in rows if r["record_type"] == "high_ei_sequence"]
+        assert {r["is_ifbench_direct"] for r in high} == {True, False}
+
+    def test_masked_rows_count_but_are_not_retained(self) -> None:
+        acc = _is_accumulator()
+        _record_batch(
+            acc,
+            environments=["math", "math"],
+            weight_versions=[5, 5],
+            errors=[1.1, 9.0],
+            sample_mask=[1.0, 0.0],
+        )
+        metrics, _ = acc.flush()
+        assert metrics["importance_sampling/lag_0/num_sequences"] == 2.0
+        assert metrics["importance_sampling/lag_0/masked_sequence_fraction"] == (
+            pytest.approx(0.5)
+        )
+        # The masked row's error must not drag the retained mean.
+        assert metrics["importance_sampling/lag_0/retained_ei_mean"] == pytest.approx(
+            1.1
+        )
+
+    def test_flush_resets_state(self) -> None:
+        acc = _is_accumulator()
+        _record_batch(acc, environments=["math"], weight_versions=[5])
+        acc.flush()
+        assert acc.flush() == ({}, [])
+
+    def test_mixing_optimizer_steps_is_rejected(self) -> None:
+        acc = _is_accumulator()
+        _record_batch(acc, environments=["math"], weight_versions=[5])
+        with pytest.raises(ValueError, match="mixed optimizer steps"):
+            acc.record(
+                step=2,
+                trainer_version=5,
+                sample_ids=["grp0_g0"],
+                rollout_tags=[{"rollout_environment": "math"}],
+                rollout_weight_versions=[5],
+                sequence_lengths=[8],
+                prev_logprobs=torch.zeros(1, 4),
+                generation_logprobs=torch.zeros(1, 4),
+                token_mask=torch.ones(1, 4),
+                sample_mask=torch.ones(1),
+                advantages=torch.zeros(1, 4),
+                rewards=torch.ones(1),
+                seq_mult_prob_error=torch.tensor([1.2]),
+                valid_seq_mask=torch.ones(1, dtype=torch.bool),
+            )
+
+    def test_misaligned_batch_metadata_is_rejected(self) -> None:
+        acc = _is_accumulator()
+        with pytest.raises(ValueError, match="misaligned"):
+            acc.record(
+                step=1,
+                trainer_version=5,
+                sample_ids=["grp0_g0"],
+                rollout_tags=[{"rollout_environment": "math"}],
+                rollout_weight_versions=[5],
+                sequence_lengths=[8],
+                prev_logprobs=torch.zeros(2, 4),
+                generation_logprobs=torch.zeros(2, 4),
+                token_mask=torch.ones(2, 4),
+                sample_mask=torch.ones(2),
+                advantages=torch.zeros(2, 4),
+                rewards=torch.ones(2),
+                seq_mult_prob_error=torch.tensor([1.2, 1.3]),
+                valid_seq_mask=torch.ones(2, dtype=torch.bool),
+            )

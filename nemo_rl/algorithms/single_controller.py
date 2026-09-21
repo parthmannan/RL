@@ -53,7 +53,7 @@ import threading
 import time
 import uuid
 import warnings
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Iterator
 from dataclasses import dataclass
 from functools import partial
@@ -125,6 +125,7 @@ from nemo_rl.algorithms.single_controller_utils.setup import (
     _register_single_controller_partitions,
 )
 from nemo_rl.algorithms.single_controller_utils.utils import (
+    ImportanceSamplingDiagnosticsAccumulator,
     aggregate_step_metrics,
     apply_message_level_advantage_penalties,
     fields_for_put,
@@ -157,6 +158,11 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
+from nemo_rl.experience.interfaces import (
+    DATASET_SOURCE_TAG,
+    PASS_RATE_TAG,
+    STALENESS_TAG,
+)
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.experience.rollout_recovery import (
@@ -337,6 +343,24 @@ class SingleControllerActor:
             or self._algo_cfg.malformed_thinking_advantage is not None
         )
 
+        self._importance_sampling_diagnostics = (
+            ImportanceSamplingDiagnosticsAccumulator(
+                sequence_level_importance_ratios=(
+                    master_config.loss_fn.sequence_level_importance_ratios
+                ),
+                truncated_importance_sampling_ratio=(
+                    master_config.loss_fn.truncated_importance_sampling_ratio
+                ),
+                truncated_importance_sampling_ratio_min=(
+                    master_config.loss_fn.truncated_importance_sampling_ratio_min
+                ),
+                truncated_importance_sampling_type=(
+                    master_config.loss_fn.truncated_importance_sampling_type
+                ),
+            )
+            if self._async_cfg.importance_sampling_diagnostics
+            else None
+        )
         self._policy_logprobs_required = not (
             master_config.loss_fn.force_on_policy_ratio
             and self._algo_cfg.seq_logprob_error_threshold is None
@@ -658,8 +682,25 @@ class SingleControllerActor:
             "num_mask_sample_filtered": [],
             "sequence_lengths": [],
             "seq_logprob_error_metrics": [],
+            "stalenesses": [],
             **{key: [] for key in VIOLATION_TAG_KEYS},
         }
+
+        # Per-step blend composition. _step_dataset_sources counts the raw
+        # dataset source of every prompt group the trainer consumed since the
+        # last optimizer step; at step close we snapshot it into
+        # _dataset_composition_history keyed by version_during_step and rewrite
+        # {log_dir}/dataset_composition.json. Percentages plus raw counts are
+        # both recorded so a step that shrank under drop/replace stays
+        # explainable after the fact. Kept out of _step_log_dict because the
+        # reducer expects numeric lists, not strings.
+        self._step_dataset_sources: Counter[str] = Counter()
+        # Per-dataset-source pass_rate values for prompt groups consumed this
+        # step, read off the same tag as _step_dataset_sources so the two stay
+        # aligned. Reduced to a per-source mean at step close. Composition-only:
+        # pass_rate is deliberately not reduced into the wandb step metrics.
+        self._step_dataset_source_pass_rates: dict[str, list[float]] = {}
+        self._dataset_composition_history: dict[int, dict[str, Any]] = {}
         self._opd_stat_sum = 0.0
         self._opd_stat_sumsq = 0.0
         self._opd_stat_count = 0
@@ -2996,6 +3037,35 @@ class SingleControllerActor:
                 except RayActorError as error:
                     log.warning("Skipping generation step metrics: %s", error)
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
+                diagnostic_rows: list[dict[str, Any]] = []
+                if self._importance_sampling_diagnostics is not None:
+                    diagnostic_metrics, diagnostic_rows = (
+                        self._importance_sampling_diagnostics.flush()
+                    )
+                    step_metrics.update(diagnostic_metrics)
+
+                # Snapshot the just-closed step's dataset-source composition and
+                # rewrite the on-disk history. version_during_step is the step's
+                # zero-indexed identifier -- the same key _batch_shortfall uses --
+                # so the JSON reads as {"0": {...}, "1": {...}, ...}. mean_pass_rate
+                # is recorded here only; pass_rate is intentionally kept out of the
+                # wandb step metrics.
+                if self._step_dataset_sources:
+                    total = sum(self._step_dataset_sources.values())
+                    self._dataset_composition_history[version_during_step] = {
+                        "counts": dict(self._step_dataset_sources),
+                        "percentages": {
+                            k: v / total for k, v in self._step_dataset_sources.items()
+                        },
+                        "total_groups": total,
+                        "mean_pass_rate": {
+                            k: statistics.fmean(v)
+                            for k, v in self._step_dataset_source_pass_rates.items()
+                        },
+                    }
+                    self._write_dataset_composition()
+                    self._step_dataset_sources = Counter()
+                    self._step_dataset_source_pass_rates = {}
                 step_metrics.update(
                     _pooled_opd_metrics(
                         self._opd_stat_sum,
@@ -3039,6 +3109,14 @@ class SingleControllerActor:
                     for step, promoted in self._batch_promotions.items()
                     if step > version_during_step
                 }
+                if diagnostic_rows:
+                    self._logger.log_string_list_as_jsonl(
+                        [json.dumps(row, sort_keys=True) for row in diagnostic_rows],
+                        (
+                            "importance_sampling/"
+                            f"train_data_step{self._train_steps}.jsonl"
+                        ),
+                    )
                 # What the step actually trained on, which is num_prompts_per_step only
                 # when nothing was dropped. Counted from the dispatch tally rather than
                 # derived from the shortfall so the figure does not depend on the
@@ -4439,6 +4517,26 @@ class SingleControllerActor:
             if self._async_cfg.diagnostics:
                 print(f"rollout_throughput_metrics={metrics}", flush=True)
 
+    def _write_dataset_composition(self) -> None:
+        """Atomically rewrite {log_dir}/dataset_composition.json.
+
+        Runs on every optimizer step boundary that produced dataset-source
+        stamps, rewriting the whole history each time -- bounded at low hundreds
+        of KiB for a full campaign, so cheap enough not to batch. Write-to-tmp
+        plus os.replace means a crash mid-write leaves the previous complete
+        file rather than truncated JSON. No-ops when the logger config carries
+        no log_dir, so unit tests that construct the actor without a run
+        directory need no temp path.
+        """
+        log_dir = self._master_config.logger.get("log_dir")
+        if not log_dir:
+            return
+        out_path = os.path.join(log_dir, "dataset_composition.json")
+        tmp_path = out_path + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(self._dataset_composition_history, f, indent=2, sort_keys=True)
+        os.replace(tmp_path, out_path)
+
     async def _save_checkpoint(
         self,
         step_metrics: dict[str, Any],
@@ -4945,6 +5043,23 @@ class SingleControllerActor:
         for tag in meta.tags or []:
             for key in VIOLATION_TAG_KEYS:
                 self._step_log_dict.setdefault(key, []).append(int(tag.get(key, 0)))
+            # Stamped in TQReplayBuffer.commit(). Accumulated here rather than at
+            # the optimizer boundary so a train step assembled from several
+            # sampler dispatches (ReadyFirst/Windowed) covers every chunk.
+            staleness = tag.get(STALENESS_TAG)
+            if staleness is not None:
+                self._step_log_dict["stalenesses"].append(int(staleness))
+            # dataset_source rides the group's first row only, so each group
+            # contributes exactly once and percentages track prompt-group share
+            # of the batch rather than row share.
+            dataset_source = tag.get(DATASET_SOURCE_TAG)
+            if dataset_source is not None:
+                self._step_dataset_sources[dataset_source] += 1
+                pass_rate = tag.get(PASS_RATE_TAG)
+                if pass_rate is not None:
+                    self._step_dataset_source_pass_rates.setdefault(
+                        dataset_source, []
+                    ).append(float(pass_rate))
 
         if self._advantage_estimator is None:
             return meta, True
@@ -5003,11 +5118,14 @@ class SingleControllerActor:
                 .sum()
                 .item()
             )
-            seq_error_metrics = compute_and_apply_seq_logprob_error_masking(
+            seq_error_result = compute_and_apply_seq_logprob_error_masking(
                 train_data=masking_data,
                 rewards=rewards,
                 seq_logprob_error_threshold=seq_logprob_error_threshold,
+                return_per_sequence_errors=True,
             )
+            assert isinstance(seq_error_result, tuple)
+            seq_error_metrics, seq_mult_prob_error, valid_seq_mask = seq_error_result
             final_sample_mask = masking_data["sample_mask"]
             num_valid_seqs_after = float(
                 ((token_mask[:, 1:] * final_sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
@@ -5121,6 +5239,34 @@ class SingleControllerActor:
         self._step_log_dict["masked_advantages"].append(
             response_advantages.detach().cpu()
         )
+        if self._importance_sampling_diagnostics is not None:
+            # seq_mult_prob_error / valid_seq_mask are bound above under
+            # _policy_logprobs_required, which validate_single_controller_config
+            # guarantees is true whenever these diagnostics are enabled.
+            if meta.tags is None:
+                raise ValueError(
+                    "importance-sampling diagnostics require rollout weight-version tags"
+                )
+            self._importance_sampling_diagnostics.record(
+                step=self._train_steps + 1,
+                trainer_version=self._trainer_version,
+                sample_ids=list(meta.sample_ids),
+                rollout_tags=list(meta.tags),
+                rollout_weight_versions=[
+                    int(tag["weight_version"]) for tag in meta.tags
+                ],
+                sequence_lengths=meta.sequence_lengths,
+                prev_logprobs=tensor_field(data, adv_cfg.policy_logprobs_field),
+                generation_logprobs=tensor_field(
+                    data, adv_cfg.generation_logprobs_field
+                ),
+                token_mask=token_mask,
+                sample_mask=final_sample_mask,
+                advantages=advantages,
+                rewards=rewards,
+                seq_mult_prob_error=seq_mult_prob_error,
+                valid_seq_mask=valid_seq_mask,
+            )
 
         fields_to_put = {adv_cfg.output_field: advantages}
         if not torch.equal(final_sample_mask, sample_mask):
