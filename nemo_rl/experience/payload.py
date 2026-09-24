@@ -36,7 +36,12 @@ from nemo_rl.data_plane.schema import (
     TRUNCATED,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.interfaces import PromptGroupRecord
+from nemo_rl.experience.interfaces import (
+    DATASET_SOURCE_TAG,
+    PASS_RATE_TAG,
+    ROLLOUT_ENVIRONMENT_TAG,
+    PromptGroupRecord,
+)
 
 VIOLATION_TAG_KEYS = (
     "num_invalid_tool_calls",
@@ -49,29 +54,72 @@ VIOLATION_TAG_KEYS = (
 _VIOLATION_COUNTS_KEY = "violation_counts"
 
 
-def record_environment(record: PromptGroupRecord) -> str:
-    """Name the environment a prompt group was rolled out against.
+def prompt_group_tags(
+    extra_env_info: Any, metadata: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """Derive the prompt-scoped tag values both commit paths stamp.
 
-    NeMo-Gym identifies an environment through ``agent_ref.name``. Native
-    environments do not carry an agent reference, so their task name is the
-    stable fallback.
+    Shared so the token-capture path (which reserves before the rollout exists
+    and applies these in commit_finalized) and the normal path (which derives
+    them inline from the PromptGroupRecord) cannot drift apart.
 
     Args:
-        record: Completed prompt group to name.
+        extra_env_info: The prompt's extra_env_info, or None.
+        metadata: The record's metadata, consulted only for the environment
+            fallback. Omit when unavailable, as at reserve() time.
 
     Returns:
-        The environment name, or ``"unknown"`` when neither source is usable.
+        Only the keys that could be resolved -- callers stamp what is present
+        rather than writing None placeholders.
     """
-    if isinstance(record.extra_env_info, dict):
-        agent_ref = record.extra_env_info.get("agent_ref")
+    tags: dict[str, Any] = {}
+    environment: str | None = None
+    if isinstance(extra_env_info, dict):
+        agent_ref = extra_env_info.get("agent_ref")
         if isinstance(agent_ref, dict):
-            agent_name = agent_ref.get("name")
-            if isinstance(agent_name, str) and agent_name.strip():
-                return agent_name.strip()
-    task_name = record.metadata.get("task_name")
-    if isinstance(task_name, str) and task_name.strip():
-        return task_name.strip()
-    return "unknown"
+            name = agent_ref.get("name")
+            if isinstance(name, str) and name.strip():
+                environment = name.strip()
+        dataset_source = extra_env_info.get("dataset")
+        if dataset_source is not None:
+            tags[DATASET_SOURCE_TAG] = str(dataset_source)
+        pass_rate = extra_env_info.get("pass_rate")
+        if pass_rate is not None:
+            tags[PASS_RATE_TAG] = float(pass_rate)
+    if environment is None and metadata:
+        task_name = metadata.get("task_name")
+        if isinstance(task_name, str) and task_name.strip():
+            environment = task_name.strip()
+    if environment is not None:
+        tags[ROLLOUT_ENVIRONMENT_TAG] = environment
+    return tags
+
+
+def apply_prompt_group_tags(
+    tags: list[dict[str, Any]], prompt_tags: Mapping[str, Any]
+) -> None:
+    """Stamp prompt-derived values onto a group's row tags, in place.
+
+    The split is not cosmetic. ``rollout_environment`` goes on EVERY row because
+    consumers mask per row -- the importance-sampling cohort split reads it off
+    each row it classifies, so a first-row-only stamp would silently shrink the
+    cohort to one of N. ``dataset_source`` and ``pass_rate`` are per-prompt-group
+    properties (all N generations share one dataset row), so one tag per group
+    keeps the payload small and gives the trainer a natural dedup key -- blend
+    percentages then track prompt-group share rather than row share.
+
+    Consumers needing per-row attribution against a group-scoped value rebuild
+    the mapping from ``prompt_idx``, which pack_payload stamps on every row.
+    """
+    if not tags:
+        return
+    environment = prompt_tags.get(ROLLOUT_ENVIRONMENT_TAG)
+    if environment is not None:
+        for tag in tags:
+            tag[ROLLOUT_ENVIRONMENT_TAG] = environment
+    for key in (DATASET_SOURCE_TAG, PASS_RATE_TAG):
+        if key in prompt_tags:
+            tags[0][key] = prompt_tags[key]
 
 
 def _violation_counts(

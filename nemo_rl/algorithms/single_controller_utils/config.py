@@ -504,6 +504,10 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # Log bounded per-lag importance-sampling summaries and compact JSONL rows.
     # Uses policy logprobs already required by the training configuration.
     importance_sampling_diagnostics: bool = False
+    # Break staleness out per dataset source (dataset_staleness/<source>/*).
+    # Off by default: the key count scales with the blend's source count, which
+    # is large enough on production blends to be worth opting into.
+    per_source_staleness_metrics: bool = False
 
     @model_validator(mode="after")
     def _reject_renamed_blocks(self) -> "AsyncRLConfig":

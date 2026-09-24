@@ -39,6 +39,10 @@ async_rl:
   # Log bounded per-lag importance-ratio summaries and compact JSONL rows.
   # Requires policy logprobs to already be enabled by the training configuration.
   importance_sampling_diagnostics: false
+  # Break staleness out per dataset source (dataset_staleness/<source>/*). The
+  # emitted key count scales with the blend's distinct source count, so this is
+  # opt-in rather than on by default.
+  per_source_staleness_metrics: false
 
   # ── Resiliency ─────────────────────────────────────────────────────────────
   # What happens to a prompt whose rollout fails. Infrastructure failures are

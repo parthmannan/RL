@@ -24,8 +24,9 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.payload import (
+    apply_prompt_group_tags,
     pack_payload,
-    record_environment,
+    prompt_group_tags,
     record_to_train_batch,
 )
 
@@ -480,36 +481,56 @@ def test_pack_payload_stamps_violation_counts_on_tags() -> None:
     ]
 
 
-def _record_for_environment(
-    extra_env_info: dict | None, metadata: dict
-) -> PromptGroupRecord:
-    return PromptGroupRecord(
-        prompt_idx=0,
-        prompt=[],
-        extra_env_info=extra_env_info,
-        metadata=metadata,
-        completions=[],
-        rollout_metrics={},
-    )
-
-
-class TestRecordEnvironment:
-    def test_prefers_nemo_gym_agent_name(self) -> None:
-        record = _record_for_environment(
-            {"agent_ref": {"name": "  ifbench_agent  "}},
-            {"task_name": "math"},
+class TestPromptGroupTags:
+    def test_derives_all_three_from_extra_env_info(self) -> None:
+        tags = prompt_group_tags(
+            {
+                "agent_ref": {"name": "  ifbench_agent  "},
+                "dataset": "ifbench",
+                "pass_rate": 0.25,
+            }
         )
-        assert record_environment(record) == "ifbench_agent"
+        assert tags == {
+            "rollout_environment": "ifbench_agent",
+            "dataset_source": "ifbench",
+            "pass_rate": 0.25,
+        }
 
-    def test_falls_back_to_task_name(self) -> None:
-        record = _record_for_environment(None, {"task_name": "math"})
-        assert record_environment(record) == "math"
+    def test_omits_absent_keys_rather_than_writing_none(self) -> None:
+        # Blends without pass_rate (e.g. ultra_rlhf_*) must not get a None
+        # placeholder -- the consumer distinguishes absent from present.
+        assert prompt_group_tags({"dataset": "ds"}) == {"dataset_source": "ds"}
+        assert prompt_group_tags(None) == {}
 
-    def test_blank_agent_name_falls_through(self) -> None:
-        record = _record_for_environment(
-            {"agent_ref": {"name": "   "}}, {"task_name": "math"}
+    def test_environment_falls_back_to_task_name_only_with_metadata(self) -> None:
+        assert prompt_group_tags(None, {"task_name": "math"}) == {
+            "rollout_environment": "math"
+        }
+        # At reserve() time metadata is unavailable; no fallback is invented.
+        assert "rollout_environment" not in prompt_group_tags({"dataset": "ds"})
+
+
+class TestApplyPromptGroupTags:
+    def test_environment_is_per_row_blend_values_are_per_group(self) -> None:
+        # The IS cohort split masks per row, so a first-row-only environment
+        # would shrink the cohort to one of N.
+        tags = [{"weight_version": 3} for _ in range(3)]
+        apply_prompt_group_tags(
+            tags,
+            {
+                "rollout_environment": "ifbench_agent",
+                "dataset_source": "ifbench",
+                "pass_rate": 0.5,
+            },
         )
-        assert record_environment(record) == "math"
+        assert [t["rollout_environment"] for t in tags] == ["ifbench_agent"] * 3
+        assert tags[0]["dataset_source"] == "ifbench"
+        assert all("dataset_source" not in t for t in tags[1:])
 
-    def test_unknown_when_neither_source_is_usable(self) -> None:
-        assert record_environment(_record_for_environment(None, {})) == "unknown"
+    def test_empty_inputs_are_no_ops(self) -> None:
+        tags: list[dict] = []
+        apply_prompt_group_tags(tags, {"dataset_source": "ds"})
+        assert tags == []
+        tags = [{"weight_version": 1}]
+        apply_prompt_group_tags(tags, {})
+        assert tags == [{"weight_version": 1}]

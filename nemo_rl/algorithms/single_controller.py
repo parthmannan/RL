@@ -161,7 +161,6 @@ from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.interfaces import (
     DATASET_SOURCE_TAG,
     PASS_RATE_TAG,
-    STALENESS_TAG,
 )
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.rollout_manager import RolloutOutcome
@@ -360,6 +359,9 @@ class SingleControllerActor:
             )
             if self._async_cfg.importance_sampling_diagnostics
             else None
+        )
+        self._per_source_staleness_metrics = (
+            self._async_cfg.per_source_staleness_metrics
         )
         self._policy_logprobs_required = not (
             master_config.loss_fn.force_on_policy_ratio
@@ -700,6 +702,9 @@ class SingleControllerActor:
         # aligned. Reduced to a per-source mean at step close. Composition-only:
         # pass_rate is deliberately not reduced into the wandb step metrics.
         self._step_dataset_source_pass_rates: dict[str, list[float]] = {}
+        # Per-source staleness for this step, gated by the config flag because
+        # the emitted key count scales with the blend's distinct source count.
+        self._step_dataset_source_stalenesses: dict[str, list[int]] = {}
         self._dataset_composition_history: dict[int, dict[str, Any]] = {}
         self._opd_stat_sum = 0.0
         self._opd_stat_sumsq = 0.0
@@ -3066,6 +3071,21 @@ class SingleControllerActor:
                     self._write_dataset_composition()
                     self._step_dataset_sources = Counter()
                     self._step_dataset_source_pass_rates = {}
+                if self._step_dataset_source_stalenesses:
+                    for (
+                        source,
+                        values,
+                    ) in self._step_dataset_source_stalenesses.items():
+                        step_metrics[f"dataset_staleness/{source}/mean"] = (
+                            statistics.fmean(values)
+                        )
+                        step_metrics[f"dataset_staleness/{source}/min"] = float(
+                            min(values)
+                        )
+                        step_metrics[f"dataset_staleness/{source}/max"] = float(
+                            max(values)
+                        )
+                    self._step_dataset_source_stalenesses = {}
                 step_metrics.update(
                     _pooled_opd_metrics(
                         self._opd_stat_sum,
@@ -5043,12 +5063,19 @@ class SingleControllerActor:
         for tag in meta.tags or []:
             for key in VIOLATION_TAG_KEYS:
                 self._step_log_dict.setdefault(key, []).append(int(tag.get(key, 0)))
-            # Stamped in TQReplayBuffer.commit(). Accumulated here rather than at
-            # the optimizer boundary so a train step assembled from several
-            # sampler dispatches (ReadyFirst/Windowed) covers every chunk.
-            staleness = tag.get(STALENESS_TAG)
-            if staleness is not None:
-                self._step_log_dict["stalenesses"].append(int(staleness))
+            # Staleness is how far behind the trainer this sample's policy was
+            # when consumed: trainer_version - the weight version it generated
+            # under. Derived here rather than stamped at commit time because
+            # pack_payload already puts weight_version on every row on BOTH
+            # commit paths, so this needs no plumbing and cannot go missing
+            # under token capture the way a commit()-only stamp did.
+            #
+            # This is the same quantity the importance-sampling diagnostics call
+            # observed_lag; that reports it bucketed per lag, this reduces it to
+            # scalars. It is NOT the old metric, which measured weight drift
+            # between dispatch and commit and said nothing about buffer wait.
+            staleness = self._trainer_version - int(tag["weight_version"])
+            self._step_log_dict["stalenesses"].append(staleness)
             # dataset_source rides the group's first row only, so each group
             # contributes exactly once and percentages track prompt-group share
             # of the batch rather than row share.
@@ -5060,6 +5087,25 @@ class SingleControllerActor:
                     self._step_dataset_source_pass_rates.setdefault(
                         dataset_source, []
                     ).append(float(pass_rate))
+
+        # Per-source staleness needs every row, but dataset_source is stamped on
+        # the group's first row only. All N rows of a group share one dataset
+        # row, so a group -> source map recovers the attribution without growing
+        # the payload. prompt_idx is the group key: pack_payload stamps it on
+        # every row, and _advantage_stage is handed complete prompt groups, so
+        # the first row carrying the source is always in this same chunk.
+        if self._per_source_staleness_metrics:
+            source_by_group: dict[Any, str] = {}
+            for tag in meta.tags or []:
+                source = tag.get(DATASET_SOURCE_TAG)
+                if source is not None:
+                    source_by_group[tag["prompt_idx"]] = source
+            for tag in meta.tags or []:
+                source = source_by_group.get(tag["prompt_idx"])
+                if source is not None:
+                    self._step_dataset_source_stalenesses.setdefault(
+                        source, []
+                    ).append(self._trainer_version - int(tag["weight_version"]))
 
         if self._advantage_estimator is None:
             return meta, True

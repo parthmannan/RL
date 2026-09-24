@@ -52,18 +52,15 @@ from nemo_rl.data_plane.schema import (
     ROUTED_EXPERTS_FIELD,
 )
 from nemo_rl.experience.interfaces import (
-    DATASET_SOURCE_TAG,
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
-    PASS_RATE_TAG,
     RETAINED_TASK_INDICES_KEY,
-    ROLLOUT_ENVIRONMENT_TAG,
-    STALENESS_TAG,
     PromptGroupRecord,
 )
 from nemo_rl.experience.payload import (
+    apply_prompt_group_tags,
     pack_payload,
-    record_environment,
+    prompt_group_tags,
     record_to_train_batch,
 )
 from nemo_rl.utils.r3_trace import trace_rollout_payload
@@ -1133,6 +1130,11 @@ class TQReplayBuffer:
         # Parallel to the lists above; populated only in token-capture mode.
         self._rollout_ids_list: list[Optional[list[str]]] = []
         self._staging_keys_list: list[Optional[list[str]]] = []
+        # Prompt-derived tag values captured at reserve() so they survive to
+        # commit_finalized(), which never sees the PromptGroupRecord: the
+        # finalizer already wrote the canonical rows from the ledger. commit()
+        # derives the same values inline from the record it is handed.
+        self._prompt_tags_list: list[Optional[dict[str, Any]]] = []
         self._data_plane_checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
         self._post_write_enricher: Optional[
             Callable[[KVBatchMeta, PromptGroupRecord], Awaitable[KVBatchMeta]]
@@ -1182,6 +1184,7 @@ class TQReplayBuffer:
         target_step: Optional[int] = None,
         group_id: Optional[str] = None,
         rollout_ids: Optional[list[str]] = None,
+        prompt_tags: Optional[dict[str, Any]] = None,
     ) -> str:
         """Append an unready slot tagged with weight_version.
 
@@ -1212,6 +1215,7 @@ class TQReplayBuffer:
             list(rollout_ids) if rollout_ids is not None else None
         )
         self._staging_keys_list.append(None)
+        self._prompt_tags_list.append(dict(prompt_tags) if prompt_tags else None)
         return group_id
 
     async def commit(
@@ -1260,31 +1264,13 @@ class TQReplayBuffer:
             group_id=group_id,
             prompt_idx=record.prompt_idx,
         )
-        # Per-row rollout diagnostics. staleness is the weight-version gap
-        # between rollout start and commit -- a proxy for how many weight
-        # updates landed while this rollout was in flight. It is one value for
-        # the whole group, so a trainer-side mean over rows equals the mean
-        # over groups.
-        environment = record_environment(record)
-        staleness = int(end_weight_version) - int(start_weight_version)
-        for tag in tags:
-            tag[ROLLOUT_ENVIRONMENT_TAG] = environment
-            tag[STALENESS_TAG] = staleness
-
-        # Blend composition is a per-prompt-group property (all N generations
-        # of a group share one dataset row), so dataset_source and pass_rate
-        # ride the group's first row only. One tag per group keeps the payload
-        # small and gives the trainer a natural per-group dedup key --
-        # percentages then track prompt-group share of the batch rather than
-        # row share. Co-locating the two on the same tag is what lets the
-        # composition dump report a per-source mean pass_rate.
-        if isinstance(record.extra_env_info, dict):
-            dataset_source = record.extra_env_info.get("dataset")
-            if dataset_source is not None:
-                tags[0][DATASET_SOURCE_TAG] = str(dataset_source)
-            pass_rate = record.extra_env_info.get("pass_rate")
-            if pass_rate is not None:
-                tags[0][PASS_RATE_TAG] = float(pass_rate)
+        # Derived and applied through the shared helpers so this cannot drift
+        # from what commit_finalized() stamps on the token-capture path. See
+        # apply_prompt_group_tags for why environment is per-row while the
+        # blend-composition values are per-group.
+        apply_prompt_group_tags(
+            tags, prompt_group_tags(record.extra_env_info, record.metadata)
+        )
 
         if self._require_routed_experts and ROUTED_EXPERTS_FIELD not in fields:
             raise RuntimeError(
@@ -1470,6 +1456,18 @@ class TQReplayBuffer:
                     f"provided={sorted(provided_staging_keys)!r}, "
                     f"planned={sorted(plan_cleanup_keys)!r}"
                 )
+        # Apply the prompt-derived tags captured at reserve(). The finalizer built
+        # meta from the ledger and never saw the PromptGroupRecord, so without this
+        # the token-capture path silently produces no dataset_source / pass_rate /
+        # rollout_environment -- and the dataset-composition dump, which is gated
+        # on having seen at least one dataset_source, writes nothing at all.
+        #
+        # staleness is NOT applied here: the reassembler stamps it per row from
+        # each rollout's own min_wv/max_wv, which is finer than the group-level
+        # value commit() uses.
+        prompt_tags = self._prompt_tags_list[idx]
+        if prompt_tags and meta.tags:
+            apply_prompt_group_tags(meta.tags, prompt_tags)
         self.meta_list[idx] = meta
         self.start_weight_list[idx] = group_min_wv
         self.end_weight_list[idx] = group_max_wv
@@ -1510,6 +1508,7 @@ class TQReplayBuffer:
         del self._group_ids[idx]
         del self._rollout_ids_list[idx]
         del self._staging_keys_list[idx]
+        del self._prompt_tags_list[idx]
 
     async def remove(self, idxs: list[int], remove_in_dp: bool) -> int:
         """Drop entries at the given indices and optionally clear them from DataPlane.
@@ -1960,6 +1959,10 @@ class TQReplayBuffer:
             self._staging_keys_list.append(
                 list(dict.fromkeys(staging_keys)) if staging_keys else None
             )
+            # Restored groups are already canonical: their rows carry whatever
+            # prompt tags were stamped before the checkpoint, so there is nothing
+            # left to apply at commit time.
+            self._prompt_tags_list.append(None)
 
         print(
             f"📦 Restored {len(groups)} replay group(s) from checkpoint",

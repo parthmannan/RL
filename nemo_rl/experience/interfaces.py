@@ -44,10 +44,13 @@ TRAINED_TASK_INDICES_KEY = "trained_task_indices"
 # metadata sidecar lets SingleController aggregate over the exact cohort selected
 # for training without fetching tensor payloads back from the data plane.
 #
-# rollout_environment and staleness are per row; dataset_source and pass_rate are
-# prompt-group properties, so they ride the group's first row only.
+# rollout_environment is per row; dataset_source and pass_rate are prompt-group
+# properties, so they ride the group's first row only.
+#
+# There is deliberately no staleness tag: staleness is derived at consumption in
+# _advantage_stage as trainer_version - weight_version, which pack_payload
+# already stamps on every row on both commit paths.
 ROLLOUT_ENVIRONMENT_TAG = "rollout_environment"
-STALENESS_TAG = "staleness"
 DATASET_SOURCE_TAG = "dataset_source"
 PASS_RATE_TAG = "pass_rate"
 

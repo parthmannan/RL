@@ -65,6 +65,7 @@ from nemo_rl.experience.interfaces import (
     PromptGroupRecord,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.payload import prompt_group_tags
 from nemo_rl.experience.rollout_recovery import (
     PromptGroupPhase,
     PromptGroupStatus,
@@ -1920,6 +1921,10 @@ class RolloutManager:
                 weight_version=start_version,
                 target_step=target_step,
                 group_id=lineage_group_id,
+                # Carried on the slot so commit_finalized() can stamp them: the
+                # token-capture path commits from finalizer output and never sees
+                # the PromptGroupRecord these are otherwise derived from.
+                prompt_tags=prompt_group_tags(extra_env_info),
             )
             try:
                 # Registered per active attempt so cancellation follows the slot that
@@ -2230,6 +2235,7 @@ class RolloutManager:
             target_step=recovery_group.target_step,
             group_id=group_id,
             rollout_ids=list(rollout_ids),
+            prompt_tags=prompt_group_tags(attempt_extra_env_info),
         )
         pending_group_results: dict[int, SiblingSealResult] = {}
 

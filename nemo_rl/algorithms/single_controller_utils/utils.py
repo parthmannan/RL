@@ -550,9 +550,9 @@ def reduce_advantage_pump_metrics(
         num_invalid_tool_calls: Per-sample invalid tool-call counts.
         num_malformed_thinking: Per-sample malformed-thinking counts.
         num_assistant_messages: Per-sample assistant message counts (rate denominator).
-        stalenesses: Per-row staleness values (end_weight - start_weight at
-            commit time). One value per group repeated across its N rows, so
-            mean-over-rows equals mean-over-groups.
+        stalenesses: Per-row consumption lag, trainer_version minus the weight
+            version each row generated under. Genuinely per row: rows of one
+            group can differ when the group straddled a refit.
 
     Returns:
         Step-level reward, advantage, token-count, optional sequence

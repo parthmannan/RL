@@ -687,18 +687,17 @@ class TestTQReplayBufferReserveCommit:
         assert buf.end_weight_list == [4]
         assert buf.ready_list == [True]
         assert buf.meta_list[0].sample_ids == meta.sample_ids
-        # TQ tags preserve both dispatch-time weight and dataset identity, plus
-        # the rollout diagnostics stamped alongside them: staleness is
-        # end_weight - start_weight (4 - 3 = 1), and the environment falls back
-        # to "unknown" because the stub record carries neither an agent_ref nor
-        # a task_name. dataset_source / pass_rate are absent -- the stub record
-        # has no extra_env_info.
+        # TQ tags preserve dispatch-time weight and dataset identity. There is no
+        # staleness tag: it is derived at consumption from weight_version, which
+        # is already here. Nothing prompt-derived is stamped either -- the stub
+        # record has no extra_env_info and no task_name, and unresolvable values
+        # are omitted rather than given a placeholder, because the token-capture
+        # path reserves before metadata exists and a fabricated "unknown" there
+        # would be indistinguishable from a real one.
         assert meta.tags == [
             {
                 "weight_version": 3,
                 "prompt_idx": 418,
-                "rollout_environment": "unknown",
-                "staleness": 1,
             }
         ] * _N_GENS
         assert len(dp.put_calls) == 1
@@ -727,18 +726,71 @@ class TestTQReplayBufferReserveCommit:
         )
 
         assert meta.tags is not None
-        # Environment and staleness are per row: every generation of the group
-        # was produced by the same agent under the same weight drift.
+        # Environment is per row -- the IS cohort split masks per row.
         assert [t["rollout_environment"] for t in meta.tags] == [
             "instruction_following_simple_agent"
         ] * _N_GENS
-        assert [t["staleness"] for t in meta.tags] == [2] * _N_GENS
         # Blend composition is a prompt-group property, so dataset_source and
         # pass_rate ride the first row only -- one contribution per group.
         assert meta.tags[0]["dataset_source"] == "ifbench"
         assert meta.tags[0]["pass_rate"] == 0.25
         assert all("dataset_source" not in t for t in meta.tags[1:])
         assert all("pass_rate" not in t for t in meta.tags[1:])
+
+    def test_commit_finalized_applies_prompt_tags_from_reserve(self):
+        """Token-capture path: commit_finalized never sees the PromptGroupRecord.
+
+        Without the prompt tags carried on the slot from reserve(), this path
+        stamps no dataset_source, so the composition dump -- gated on having seen
+        at least one -- silently writes nothing.
+        """
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        group_id = buf.reserve(
+            weight_version=3,
+            prompt_tags={
+                "dataset_source": "ifbench",
+                "pass_rate": 0.25,
+                "rollout_environment": "instruction_following_simple_agent",
+            },
+        )
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=[f"{group_id}_g0", f"{group_id}_g1"],
+            fields=["input_ids"],
+            sequence_lengths=[3, 3],
+            tags=[{"weight_version": 3}, {"weight_version": 3}],
+        )
+        out = _run(_commit_finalized(buf, group_id, meta, 3, 5))
+
+        assert out.tags is not None
+        # Group-scoped values ride the first row only, matching commit().
+        assert out.tags[0]["dataset_source"] == "ifbench"
+        assert out.tags[0]["pass_rate"] == 0.25
+        # Environment is per row -- the IS cohort split masks per row.
+        assert [t["rollout_environment"] for t in out.tags] == [
+            "instruction_following_simple_agent"
+        ] * 2
+        assert "dataset_source" not in out.tags[1]
+        # No staleness tag on either commit path; it is derived at consumption
+        # from weight_version, which pack_payload stamps on every row.
+        assert all("staleness" not in t for t in out.tags)
+
+    def test_reserve_without_prompt_tags_leaves_tags_untouched(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        group_id = buf.reserve(weight_version=3)
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=[f"{group_id}_g0"],
+            fields=["input_ids"],
+            sequence_lengths=[3],
+            tags=[{"weight_version": 3}],
+        )
+        out = _run(_commit_finalized(buf, group_id, meta, 3, 3))
+        assert out.tags == [{"weight_version": 3}]
 
     def test_commit_requires_routed_experts_before_tq_write(self):
         dp = FakeDataPlaneClient()
